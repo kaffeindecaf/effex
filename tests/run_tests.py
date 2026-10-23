@@ -7,6 +7,7 @@
     python3 tests/run_tests.py layout     # only the frame layout checks
     python3 tests/run_tests.py stateful   # processor and FFmpeg chain checks
     python3 tests/run_tests.py psychedelic # color behavior and FFmpeg renders
+    python3 tests/run_tests.py collapse seams # elastic collapse and seam carving
 
 exit 0 = all green, 1 = something failed, 0 with SKIP = no ffmpeg on PATH.
 """
@@ -23,6 +24,8 @@ SUITES = {
     "install": HERE / "install_prompt.py",
     "stateful": HERE / "stateful_regression.py",
     "psychedelic": HERE / "psychedelic_regression.py",
+    "collapse": HERE / "collapse_regression.py",
+    "seams": HERE / "seam_carving_regression.py",
 }
 
 

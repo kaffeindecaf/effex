@@ -278,3 +278,210 @@ class TemporalSediment:
         result = original * (1.0 - intensity) + full_history * intensity
         return np.ascontiguousarray(np.clip(result * 255.0, 0.0, 255.0)
                                     .round().astype(np.uint8))
+
+
+class ElasticCollapse:
+    """Content-weighted CPU displacement with bounded low-resolution state.
+
+    OpenCV is loaded only on initialization. Full-size maps are transient;
+    evolving fields and scene/motion analysis never exceed MAX_WORK_SIDE.
+    """
+
+    MAX_WORK_SIDE = 192
+    MAX_STATE_BYTES = 4 * 1024 * 1024
+    DEFAULTS = {
+        "intensity": 65, "horizontal": 65, "vertical": 45, "preserve": 75,
+        "mode": "elastic", "seam_strength": 60, "motion": 50,
+        "smoothness": 70, "speed": 0.35, "coherence": 80, "seed": 0,
+    }
+
+    def __init__(self):
+        self._np: Any = None
+        self._cv: Any = None
+        self._config = {}
+        self._shape = (0, 0, 0)
+        self._work_shape = (0, 0)
+        self._fps = 30.0
+        self._seed = 0
+        self._x: Any = None
+        self._y: Any = None
+        self._phase: Any = None
+        self._field: Any = None
+        self._previous_rgb: Any = None
+        self._previous_timestamp: Optional[float] = None
+        self._next_index: Optional[int] = None
+        self._clock = 0.0
+        self._seam_target: Any = None
+        self._next_seam_time = 0.0
+        self.seam_updates = 0
+
+    @staticmethod
+    def _number(value, default, low, high):
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return max(low, min(high, number)) if math.isfinite(number) else default
+
+    def initialize(self, config: dict, frame_shape: tuple, fps: float,
+                   seed: int) -> None:
+        try:
+            import numpy as np
+            import cv2
+        except ImportError as exc:
+            raise RuntimeError(
+                "Elastic Collapse needs NumPy and headless OpenCV; install "
+                "requirements-collapse.txt"
+            ) from exc
+        if (len(frame_shape) != 3 or frame_shape[2] != 3
+                or any(int(v) < 1 for v in frame_shape)):
+            raise ValueError("Elastic Collapse expects an HxWx3 RGB frame")
+        self._np, self._cv = np, cv2
+        self._shape = tuple(int(v) for v in frame_shape)
+        self._config = {}
+        for key, default in self.DEFAULTS.items():
+            if key == "mode":
+                mode = str(config.get(key, default))
+                if mode not in ("elastic", "seam"):
+                    raise ValueError("collapse mode must be elastic or seam")
+                self._config[key] = mode
+            else:
+                high = 4.0 if key == "speed" else (2147483647 if key == "seed" else 100)
+                number = self._number(config.get(key, default), default, 0, high)
+                self._config[key] = number if key == "speed" else int(number)
+        self._fps = self._number(fps, 30.0, 0.001, 1000)
+        self._seed = int(self._number(seed, 0, 0, 2147483647))
+        height, width = self._shape[:2]
+        scale = min(1.0, self.MAX_WORK_SIDE / max(height, width))
+        self._work_shape = (max(1, round(height * scale)),
+                            max(1, round(width * scale)))
+        self._y, self._x = np.meshgrid(
+            np.linspace(0, 1, self._work_shape[0], dtype=np.float32),
+            np.linspace(0, 1, self._work_shape[1], dtype=np.float32), indexing="ij")
+        self.reset()
+
+    @property
+    def work_shape(self) -> tuple:
+        return self._work_shape
+
+    @property
+    def state_nbytes(self) -> int:
+        return sum(int(value.nbytes) for value in
+                   (self._x, self._y, self._phase, self._field, self._previous_rgb,
+                    self._seam_target)
+                   if value is not None)
+
+    @property
+    def displacement(self) -> Any:
+        """A copy of the applied normalized (dx, dy) field for diagnostics."""
+        if self._field is None:
+            return None
+        return self._field * (self._config["intensity"] / 100.0)
+
+    def serialize_config(self) -> dict:
+        return dict(self._config)
+
+    def reset(self) -> None:
+        if self._np is None:
+            return
+        self._phase = self._np.random.default_rng(self._seed).uniform(0, 2 * math.pi, 4)
+        self._field = None
+        self._previous_rgb = None
+        self._previous_timestamp = None
+        self._next_index = None
+        self._clock = 0.0
+        self._seam_target = None
+        self._next_seam_time = 0.0
+        self.seam_updates = 0
+
+    def _seam_field(self, current):
+        from seam_carving import build_seam_field
+
+        # Never perform catch-up carving after a gap: one bounded update only.
+        if self._seam_target is None or self._clock + 1e-9 >= self._next_seam_time:
+            target = build_seam_field(
+                current, self._config["horizontal"] / 100.0,
+                self._config["vertical"] / 100.0,
+                self._config["seam_strength"] / 100.0,
+                self._config["preserve"] / 100.0, max_seams=4,
+            )
+            self._seam_target = self._cv.GaussianBlur(
+                target, (0, 0), 0.5 + 3 * self._config["smoothness"] / 100.0)
+            self._next_seam_time = self._clock + 0.2
+            self.seam_updates += 1
+        return self._seam_target
+
+    def _elastic_field(self, current):
+        np, cv = self._np, self._cv
+        x, y, phase = self._x, self._y, self._phase
+        smooth = self._config["smoothness"] / 100.0
+        frequency = 1.0 + (1.0 - smooth) * 4.0
+        t = self._clock * self._config["speed"] * 2 * math.pi
+        dx = (np.sin(2 * math.pi * frequency * y + phase[0] + t)
+              + 0.5 * np.sin(2 * math.pi * (x + y) + phase[1] - t * 0.7))
+        dy = (np.sin(2 * math.pi * frequency * x + phase[2] - t)
+              + 0.5 * np.sin(2 * math.pi * (x - y) + phase[3] + t * 0.7))
+        field = np.stack((dx * self._config["horizontal"] / 100.0,
+                          dy * self._config["vertical"] / 100.0), axis=-1)
+        # Base field is at most 18% per axis; motion below can amplify it 2x.
+        field *= (0.12 * np.sin(math.pi * x) * np.sin(math.pi * y))[:, :, None]
+        field = cv.GaussianBlur(field, (0, 0), 0.5 + 4.0 * smooth)
+        gray = cv.cvtColor(current, cv.COLOR_RGB2GRAY).astype(np.float32)
+        gx = cv.Sobel(gray, cv.CV_32F, 1, 0, ksize=3, scale=0.25)
+        gy = cv.Sobel(gray, cv.CV_32F, 0, 1, ksize=3, scale=0.25)
+        energy = cv.GaussianBlur(np.minimum(cv.magnitude(gx, gy) / 64.0, 1),
+                                 (0, 0), 1.2)
+        field *= (1 - 0.95 * self._config["preserve"] / 100.0 * energy)[:, :, None]
+        if self._previous_rgb is not None and self._config["motion"]:
+            difference = np.abs(current.astype(np.float32)
+                                - self._previous_rgb.astype(np.float32)).mean(axis=2)
+            moving = cv.GaussianBlur(np.minimum(difference / 64.0, 1), (0, 0), 2.0)
+            field *= (1 + self._config["motion"] / 100.0 * moving)[:, :, None]
+        return field.astype(np.float32)
+
+    def process(self, frame, frame_index: int, timestamp: Optional[float],
+                context: Optional[dict] = None):
+        if self._np is None:
+            raise RuntimeError("initialize Elastic Collapse before processing")
+        np, cv = self._np, self._cv
+        if not isinstance(frame, np.ndarray) or frame.shape != self._shape or frame.dtype != np.uint8:
+            raise ValueError(f"expected uint8 RGB frame {self._shape}")
+        height, width = self._shape[:2]
+        current = cv.resize(frame, (self._work_shape[1], self._work_shape[0]),
+                            interpolation=cv.INTER_AREA)
+        stamp = self._number(timestamp, None, -1e12, 1e12)
+        index = int(frame_index)
+        rewind = (stamp is not None and self._previous_timestamp is not None
+                  and stamp < self._previous_timestamp)
+        cut = (self._previous_rgb is not None and
+               float(np.abs(current.astype(np.float32)
+                            - self._previous_rgb.astype(np.float32)).mean()) / 255 >= 0.55)
+        if ((self._next_index is not None and index != self._next_index)
+                or rewind or cut or (context or {}).get("scene_cut")):
+            self.reset()
+        dt = (max(0.0, stamp - self._previous_timestamp)
+              if stamp is not None and self._previous_timestamp is not None
+              else 1.0 / self._fps)
+        if self._previous_rgb is not None:
+            self._clock += dt
+        target = (self._seam_field(current) if self._config["mode"] == "seam"
+                  else self._elastic_field(current))
+        coherence = self._config["coherence"] / 100.0
+        alpha = 1.0 if coherence == 0 else -math.expm1(-dt / (coherence * coherence * 0.75))
+        if self._field is None:
+            self._field = target
+        else:
+            self._field += (target - self._field) * alpha
+        self._previous_rgb = current.copy()
+        self._previous_timestamp = stamp
+        self._next_index = index + 1
+        intensity = self._config["intensity"] / 100.0
+        if intensity == 0 or not (self._config["horizontal"] or self._config["vertical"]):
+            return frame.copy()
+        full = cv.resize(self._field, (width, height), interpolation=cv.INTER_LINEAR)
+        map_x = full[:, :, 0] * (intensity * max(0, width - 1))
+        map_y = full[:, :, 1] * (intensity * max(0, height - 1))
+        map_x += np.arange(width, dtype=np.float32)[None, :]
+        map_y += np.arange(height, dtype=np.float32)[:, None]
+        return cv.remap(frame, map_x, map_y, interpolation=cv.INTER_LINEAR,
+                        borderMode=cv.BORDER_REFLECT_101)

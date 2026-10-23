@@ -4,10 +4,10 @@ purpose: pick one item per session, finish it end-to-end (code + test + docs),
 then check it off with a done note saying what actually landed.
 format: `[ ]` open, `[x]` done, done notes indented under the item.
 state: input/ holds source videos, output/ holds renders and previews, effex.py
-is the tool (v0.12.0, 22 effects, chains of two or more), tests/ has seven
+is the tool (v0.12.0, 23 effects, chains of two or more), tests/ has nine
 suites. verify before closing an item with:
 
-    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install + stateful + psychedelic
+    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install + stateful + psychedelic + collapse + seams
     python3 tests/make_clip.py        # drop a lavfi test clip into input/
     ./install.sh                      # effex onto ~/.local/bin
 
@@ -350,7 +350,7 @@ decision.
 
 ### stateful glitch effects
 
-Six effects from the requested design prompt. Temporal Sediment is implemented; the remaining five are checklist items, not implementations.
+Six effects from the requested design prompt. Temporal Sediment and Elastic Collapse are implemented; the remaining four are checklist items, not implementations.
 
 Shared rules for the stateful effects:
 - Trace how `effex.py` scans/probes clips, builds `Plan`s, invokes custom runners, and encodes output. The core stays FFmpeg-filter based; Temporal Sediment adds a narrow per-frame adapter for stateful effects.
@@ -373,11 +373,28 @@ Shared rules for the stateful effects:
   - On a motion event, queue a bounded frame or patch snapshot with a due timestamp. Release delayed frames or short repayment bursts without blocking the render loop. Handle clip end when queued debt remains.
   - Options: motion threshold/sensitivity, min/max delay, debt gain, release rate, burst size, freeze chance, patch mode, queue capacity, seed.
   - Test that static input creates little debt, a sudden moving shape triggers delayed output, sensitivity and release controls change behavior, fixed seeds repeat, and queue memory stays bounded.
-- [ ] E2.46 - content-aware elastic collapse (prompt effect 05): deform the image nonuniformly while keeping the output dimensions fixed.
+- [x] E2.46 - content-aware elastic collapse (prompt effect 05): deform the image nonuniformly while keeping the output dimensions fixed.
   - Make real-time elastic remapping the default: evolve a smooth displacement/scale field, then sample with a CPU remap such as `cv2.remap` if OpenCV is justified. Do not reduce this to uniform zoom.
   - Keep seam carving as an optional offline mode: use a gradient/energy map, work at reduced resolution, limit seams per update, smooth decisions over time, then resize to the required frame size. Do not carve every full-resolution frame without measuring flicker and cost.
   - Options: intensity, horizontal/vertical scale, content preservation, seam strength/mode, motion influence, field smoothness/speed, temporal coherence, seed.
   - Test fixed output size, stronger deformation at higher intensity, repeatability for a fixed seed, and less incidental flicker with temporal smoothing. Benchmark real-time and seam modes separately.
+  _Done: `collapse` defaults to seeded, smooth nonuniform elastic fields with
+  gradient-based content protection and motion weighting, sampled by CPU
+  `cv2.remap`. Offline `mode=seam` uses gradient-energy minimum-cost seams and
+  carved source-coordinate maps at <=192px, <=4 seams per axis, <=5 updates/s;
+  displacement decisions are smoothed over elapsed time. Exposes intensity,
+  axis scales, preservation, mode/strength, motion, smoothness/speed, coherence
+  and seed through the registry and menu. Reuses the stateful adapter, preserving
+  dimensions/audio and supporting sediment in either adjacent chain order.
+  Optional headless OpenCV is isolated in requirements-collapse.txt. Tests cover
+  deformation strength, content protection, repeatability, resets/cuts/rewinds,
+  tiny/short/static inputs, no mutation, passthrough, bounds, bounded state,
+  flicker reduction in both modes and real CLI/menu renders. All nine suites pass.
+  Separate 120-frame CPU benchmarks at 640x360 and 1280x720 are saved in
+  benchmarks/collapse.json, including frame time, update cost and peak process
+  RSS; README records the measured results without an end-to-end real-time claim.
+  Existing stateful VFR normalization, adjacent-processor and preview limits
+  remain explicit._
 - [ ] E2.47 - pixel archaeology (prompt effect 09): transplant patches from earlier frames using content matching.
   - Keep a bounded reservoir of old frames or patches. Cache inexpensive descriptors such as color mean/variance, gradient histograms, or downsampled pixels; sample candidates instead of searching every patch in every frame.
   - Match current regions to historical patches by color, texture, or edge compatibility. Include a controlled mismatch mode. Support hard copy and soft/feathered boundaries; every replacement must come from actual video history, not random rectangles.

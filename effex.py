@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, cast
 
-from stateful_effects import TemporalSediment
+from stateful_effects import ElasticCollapse, TemporalSediment
 
 VERSION = "0.12.0"
 
@@ -1914,6 +1914,50 @@ def build_temporal_sediment(ctx: EffectContext) -> Plan:
     )
 
 
+COLLAPSE_PARAMS = (
+    Param("intensity", "intensity", "how strongly the displacement is applied",
+          "percent", 65, minimum=0, maximum=100, step=5),
+    Param("horizontal", "horizontal scale", "horizontal deformation amount",
+          "percent", 65, minimum=0, maximum=100, step=5),
+    Param("vertical", "vertical scale", "vertical deformation amount",
+          "percent", 45, minimum=0, maximum=100, step=5),
+    Param("preserve", "content preservation", "protect strong edges from collapse",
+          "percent", 75, minimum=0, maximum=100, step=5),
+    Param("mode", "mode", "fast elastic field or bounded offline seam carving",
+          "choice", "elastic", choices=(
+              ("elastic", "elastic", "smooth content-weighted CPU remapping"),
+              ("seam", "seam (offline)", "reduced-resolution energy-based seams"),
+          )),
+    Param("seam_strength", "seam strength", "seams removed per offline update",
+          "percent", 60, minimum=0, maximum=100, step=5),
+    Param("motion", "motion influence", "amplify elastic deformation in moving regions",
+          "percent", 50, minimum=0, maximum=100, step=5),
+    Param("smoothness", "field smoothness", "larger, smoother deformation regions",
+          "percent", 70, minimum=0, maximum=100, step=5),
+    Param("speed", "field speed", "elastic field cycles per second; 0 holds it still",
+          "float", 0.35, minimum=0, maximum=4, step=0.1),
+    Param("coherence", "temporal coherence", "smooth field changes over elapsed time",
+          "percent", 80, minimum=0, maximum=100, step=5),
+    Param("seed", "random seed", "0 derives repeatable elastic phases from the clip",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_collapse(ctx: EffectContext) -> Plan:
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    mode = str(ctx.opts.get("mode", "elastic"))
+    return Plan(
+        vf=f"stateful elastic collapse ({mode}) frame pass",
+        out_suffix=ctx.suffix or "_COLLAPSED", width=width, height=height,
+        notes=[
+            "nonuniform content-aware displacement with fixed output dimensions",
+            "elastic mode uses seeded smooth fields and CPU OpenCV remapping",
+            "offline seam mode analyzes at most 192px, up to 4 seams per axis at 5Hz",
+            "needs requirements-collapse.txt; no stateful preview or original VFR PTS",
+        ],
+    )
+
+
 EFFECTS = [
     Effect(key="stretch", name="stretch",
            blurb="squash the frame into another shape",
@@ -2020,6 +2064,16 @@ EFFECTS = [
                "-c:v libx264 -c:a aac segNN.mp4",
                "pass 2: ffmpeg -f concat -i list.txt -c copy <output>.mp4",
            )),
+    Effect(key="collapse", name="elastic collapse",
+           blurb="content-aware elastic deformation or offline seam collapse",
+           tag="stateful CPU displacement and remap",
+           build=build_collapse, params=COLLAPSE_PARAMS,
+           frame_processor=ElasticCollapse,
+           stages=(
+               "decode through earlier FFmpeg filters to RGB frames",
+               "evolve content-aware elastic field or bounded low-resolution seam map",
+               "smooth displacement, CPU remap, encode with later filters and audio",
+           )),
     Effect(key="sediment", name="temporal sediment",
            blurb="deposit frames into bounded, decaying visual history",
            tag="stateful Python frame processor",
@@ -2036,6 +2090,7 @@ EFFECT_BY_KEY = {e.key: e for e in EFFECTS}
 EFFECT_GROUPS = (
     ("SHAPE & MOTION", (
         "stretch", "pixelize", "zoom", "wobble", "spin", "stutter", "slowmo",
+        "collapse",
     )),
     ("COLOR & TEXTURE", (
         "rgbsplit", "deepfry", "posterize", "channelswap", "vhs", "crt",
@@ -2468,7 +2523,7 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
     try:
         import numpy as np
     except ImportError:
-        return False, ("Temporal Sediment needs NumPy; install "
+        return False, ("Stateful frame effects need NumPy; install "
                        "requirements-stateful.txt"), 0.0
 
     plans = chain_plans(chain, ctx)
