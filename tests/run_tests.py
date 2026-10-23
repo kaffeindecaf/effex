@@ -5,6 +5,7 @@
     python3 tests/run_tests.py cli        # only the cli regression
     python3 tests/run_tests.py menu       # only the pty menu tests
     python3 tests/run_tests.py layout     # only the frame layout checks
+    python3 tests/run_tests.py stateful   # processor and FFmpeg chain checks
 
 exit 0 = all green, 1 = something failed, 0 with SKIP = no ffmpeg on PATH.
 """
@@ -19,6 +20,7 @@ SUITES = {
     "menu": HERE / "menu_smoke.py",
     "layout": HERE / "layout.py",
     "install": HERE / "install_prompt.py",
+    "stateful": HERE / "stateful_regression.py",
 }
 
 

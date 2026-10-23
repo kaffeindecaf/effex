@@ -46,6 +46,23 @@ def wait_last(d, marker: str, timeout: float = 6.0) -> bool:
     return False
 
 
+def press_and_wait(d, key: bytes, timeout: float = 3.0) -> bool:
+    before = last_frame(d)
+    d.send(key)
+    end = time.time() + timeout
+    while time.time() < end:
+        if last_frame(d) != before:
+            return True
+        d.pump(0.05)
+    return False
+
+
+def next_effect_group(d, count: int = 1) -> None:
+    for _ in range(count):
+        press_and_wait(d, b"]")
+    d.pump(0.5)
+
+
 def scenario_render_flow(c: Checker):
     """main menu -> video -> effect -> options -> confirm -> render -> quit"""
     in_dir, out_dir = temp_folders()
@@ -55,6 +72,9 @@ def scenario_render_flow(c: Checker):
 
     d = start(env)
     c.check("main menu appears", d.wait_for("main menu"))
+    c.check("home screen sketches the video workflow",
+            all(label in last_frame(d)
+                for label in ("SOURCE", "EFFECTS", "OUTPUT")))
 
     d.send(b"p")                                    # key jump: process
     c.check("video picker lists the input folder", d.wait_for("pick a video"))
@@ -80,6 +100,9 @@ def scenario_render_flow(c: Checker):
             d.wait_for("render this video?") and "1920x1080" in d.text())
 
     d.send(ENTER)                                   # default yes
+    c.check("render monitor shows the ASCII pipeline and telemetry",
+            d.wait_for("[SOURCE] -> [EFFECTS] -> [ENCODE] -> [OUTPUT]")
+            and "elapsed" in d.text() and "frames" in d.text())
     c.check("render finishes", d.wait_for("wrote", timeout=90))
 
     d.send(ENTER)                                   # enter to continue
@@ -258,7 +281,7 @@ def scenario_wobble(c: Checker):
     d.send(ENTER)
     d.wait_for("pick an effect")
 
-    d.send(b"6")                                   # jump: wobble
+    d.send(b"4")                                   # jump: wobble
     c.check("wobble options open", d.wait_for("wobble options"))
     c.check("wobble preview shows the rotate expression",
             "sin(2*PI*t/2.5)" in d.text())
@@ -385,8 +408,10 @@ def scenario_datamosh(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"9")                       # datamosh
-    c.check("datamosh options screen opens", d.wait_for("datamosh options"))
+    next_effect_group(d, 3)                       # codec & blocks group
+    d.send(ENTER)
+    c.check("datamosh options screen opens",
+            d.wait_for("datamosh options"), last_frame(d))
     c.check("the cut depth row is shown", "cut depth" in d.text())
     c.check("the hold row is shown", "hold" in d.text())
     c.check("no preview key on a two-pass effect",
@@ -418,7 +443,8 @@ def scenario_datamosh_second(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)                                  # aaa.mp4
     d.wait_for("pick an effect")
-    d.send(b"9")                                   # datamosh
+    next_effect_group(d, 3)                       # codec & blocks group
+    d.send(ENTER)
     c.check("datamosh options open for a two-source render",
             d.wait_for("datamosh options"))
     d.send(ENTER)                                  # second video row
@@ -460,7 +486,7 @@ def scenario_newkinds(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"3")                                   # rgbsplit
+    d.send(b"8")                                   # rgbsplit
     d.wait_for("rgbsplit options")
     d.send(DOWN)
     d.send(DOWN)                                   # channels row
@@ -490,7 +516,7 @@ def scenario_newkinds(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"7")                                   # spin
+    d.send(b"5")                                   # spin
     d.wait_for("spin options")
     d.send(RIGHT)
     c.check("right arrow steps the fractional period",
@@ -501,7 +527,7 @@ def scenario_newkinds(c: Checker):
     d.pump(0.5)                                    # main menu -> video picker
     d.send(ENTER)
     d.pump(0.5)                                    # video picker -> effect picker
-    d.send(b"5")                                   # deepfry
+    d.send(b"9")                                   # deepfry
     c.check("deepfry options open", d.wait_for("deepfry options"))
     d.send(ENTER)
     c.check("percent prompt names the range",
@@ -532,7 +558,7 @@ def scenario_vhs(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 10)                              # vhs, the 11th effect
+    d.send(b"j" * 11)                              # vhs, effect 12
     d.send(ENTER)
     c.check("vhs options open", d.wait_for("vhs options"))
     c.check("vhs rows are shown", "chroma bleed" in d.text()
@@ -560,7 +586,7 @@ def scenario_channelswap(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 14)                              # channelswap, 15th effect
+    d.send(b"j" * 10)                              # channelswap, effect 11
     d.send(ENTER)
     c.check("channelswap options open", d.wait_for("channelswap options"))
     c.check("channelswap rows are shown",
@@ -588,7 +614,7 @@ def scenario_timescratch(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 18)                              # timescratch, 19th effect
+    d.send(b"j" * 14)                              # timescratch, effect 15
     d.send(ENTER)
     c.check("timescratch options open", d.wait_for("timescratch options"))
     c.check("timescratch rows are shown", "curve" in d.text()
@@ -606,6 +632,53 @@ def scenario_timescratch(c: Checker):
     d.close()
 
 
+def scenario_temporal_sediment(c: Checker):
+    """the stateful effect exposes its controls and uses the normal render flow"""
+    in_dir, out_dir = temp_folders()
+    make_clip(in_dir / "clip.mp4")
+    env = env_for(in_dir, out_dir)
+
+    d = start(env)
+    d.wait_for("main menu")
+    d.send(b"p")
+    d.wait_for("pick a video")
+    d.send(ENTER)
+    d.wait_for("pick an effect")
+    d.send(b"j" * 15)                              # temporal sediment, effect 16
+    d.send(ENTER)
+    c.check("temporal sediment options open",
+            d.wait_for("temporal sediment options"))
+    c.check("sediment options expose history and excavation controls",
+            all(label in d.text() for label in
+                ("deposit rate", "decay rate", "excavation",
+                 "color memory", "random seed")))
+    c.check("stateful effect has no preview key", "p preview" not in d.text())
+    before_tune = last_frame(d)
+    d.send(RIGHT)                                    # tune intensity in menu
+    after_tune = last_frame(d)
+    c.check("sediment intensity can be adjusted in the menu",
+            before_tune != after_tune and "intensity" in after_tune
+            and "70%" in after_tune)
+    d.send(b"r")
+    c.check("sediment confirm identifies the frame pass",
+            d.wait_for("render this video?") and "CPU frame pass" in d.text())
+    d.send(ENTER)
+    c.check("sediment render finishes from the menu",
+            d.wait_for("wrote", timeout=150))
+    d.send(ENTER)
+    d.send(b"q")
+    rc = d.expect_exit(6)
+    c.check(f"clean exit (rc={rc})", rc == 0)
+    from harness import newest_mp4
+    out = newest_mp4(out_dir)
+    c.check("menu render reached disk with source dimensions",
+            out is not None and video_dims(out) == (640, 360),
+            str(video_dims(out) if out else None))
+    c.check("menu sediment render keeps AAC audio",
+            out is not None and audio_codec(out) == "aac")
+    d.close()
+
+
 def scenario_chain(c: Checker):
     """chip two effects in the picker, render them as one chain (E3.3)"""
     in_dir, out_dir = temp_folders()
@@ -619,6 +692,9 @@ def scenario_chain(c: Checker):
     d.send(ENTER)
     c.check("the effect picker offers chaining",
             d.wait_for("pick an effect") and "space chain" in d.text())
+    c.check("effect picker groups visual and color effects",
+            "SHAPE & MOTION" in last_frame(d)
+            and "COLOR & TEXTURE" in last_frame(d))
 
     d.send(b" ")                                  # chip stretch (row 1)
     c.check("chipping marks the effect and shows the chain",
@@ -672,7 +748,7 @@ def scenario_chain(c: Checker):
     d.send(ENTER)
     c.check("second visit reaches the effect picker",
             wait_last(d, "space chain"))
-    d.send(b"j" * 8)                              # datamosh, past the digits
+    next_effect_group(d, 3)                       # codec & blocks group
     d.send(b" ")
     c.check("a multi-pass effect refuses to be chained",
             wait_last(d, "nothing to chain it with"),
@@ -709,8 +785,8 @@ def main() -> int:
                      scenario_decline, scenario_datamosh,
                      scenario_datamosh_second, scenario_newkinds,
                      scenario_vhs, scenario_channelswap,
-                     scenario_timescratch, scenario_chain,
-                     scenario_backout):
+                     scenario_timescratch, scenario_temporal_sediment,
+                     scenario_chain, scenario_backout):
         print(f"  -- {scenario.__name__}")
         scenario(c)
     return c.summary()
