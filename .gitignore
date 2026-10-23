@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.vscode/
+.DS_Store
+
+/input/*
+!/input/.gitkeep
+/output/*
+!/output/.gitkeep
