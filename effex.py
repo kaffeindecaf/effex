@@ -33,7 +33,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, cast
 
-VERSION = "0.11.0"
+from stateful_effects import TemporalSediment
+
+VERSION = "0.12.0"
 
 ROOT = Path(os.path.dirname(os.path.realpath(__file__)))
 # the folders can be pointed elsewhere (env or --input-dir/--output-dir);
@@ -478,6 +480,7 @@ class Effect:
     params: tuple = ()
     run: Optional[Callable] = None
     stages: tuple = ()
+    frame_processor: Optional[Callable] = None
 
 
 @dataclass(frozen=True)
@@ -505,6 +508,10 @@ class Chain:
     @property
     def multi_pass(self) -> Optional["Effect"]:
         return next((e for e in self.effects if e.run is not None), None)
+
+    @property
+    def stateful_effects(self) -> list:
+        return [e for e in self.effects if e.frame_processor is not None]
 
     @property
     def rows(self) -> list:
@@ -1777,6 +1784,52 @@ def run_timescratch(ctx, clip, tools, args, dst, run_encode, on_progress,
         shutil.rmtree(work, ignore_errors=True)
 
 
+TEMPORAL_SEDIMENT_PARAMS = (
+    Param("intensity", "intensity", "how much accumulated history shows", "percent",
+          65, minimum=0, maximum=100, step=5),
+    Param("deposit", "deposit rate", "how strongly new frames enter history",
+          "percent", 70, minimum=0, maximum=100, step=5),
+    Param("decay", "decay rate", "how quickly old layers fade", "percent",
+          35, minimum=0, maximum=100, step=5),
+    Param("layers", "memory layers", "number of decay speeds to retain",
+          "choice", "3", choices=(
+              ("1", "1 layer", "one history speed"),
+              ("2", "2 layers", "short and long memory"),
+              ("3", "3 layers", "fast, medium and long memory"),
+          )),
+    Param("motion", "motion sensitivity", "how strongly movement deposits pixels",
+          "percent", 50, minimum=0, maximum=100, step=5),
+    Param("excavation", "excavation chance", "chance per frame to reveal an older patch",
+          "percent", 5, minimum=0, maximum=100, step=5),
+    Param("excavation_size", "excavation size", "patch width and height as a frame percent",
+          "percent", 15, minimum=5, maximum=50, step=5),
+    Param("color", "color memory", "how stored colors are treated", "choice",
+          "keep", choices=(
+              ("keep", "keep", "retain the original colors"),
+              ("warm", "warm", "tint old material amber"),
+              ("cool", "cool", "tint old material blue"),
+              ("mono", "mono", "turn old material grayscale"),
+          )),
+    Param("seed", "random seed", "0 derives a repeatable seed from the clip",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_temporal_sediment(ctx: EffectContext) -> Plan:
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    return Plan(
+        vf="stateful temporal sediment frame pass",
+        out_suffix=ctx.suffix or "_SEDIMENTED",
+        width=width,
+        height=height,
+        notes=[
+            "builds persistent, bounded frame memory with separate decay layers",
+            "motion changes where new pixels settle; excavation exposes the oldest layer",
+            "history state resets on a clip change or a detected scene cut",
+        ],
+    )
+
+
 EFFECTS = [
     Effect(key="stretch", name="stretch",
            blurb="squash the frame into another shape",
@@ -1875,9 +1928,38 @@ EFFECTS = [
                "-c:v libx264 -c:a aac segNN.mp4",
                "pass 2: ffmpeg -f concat -i list.txt -c copy <output>.mp4",
            )),
+    Effect(key="sediment", name="temporal sediment",
+           blurb="deposit frames into bounded, decaying visual history",
+           tag="stateful Python frame processor",
+           build=build_temporal_sediment, params=TEMPORAL_SEDIMENT_PARAMS,
+           frame_processor=TemporalSediment,
+           stages=(
+               "decode the source through any earlier FFmpeg filters to RGB frames",
+               "update bounded float history, apply sediment and excavation masks",
+               "encode processed frames and any later FFmpeg filters with the source audio",
+           )),
 ]
 
 EFFECT_BY_KEY = {e.key: e for e in EFFECTS}
+EFFECT_GROUPS = (
+    ("SHAPE & MOTION", (
+        "stretch", "pixelize", "zoom", "wobble", "spin", "stutter", "slowmo",
+    )),
+    ("COLOR & TEXTURE", (
+        "rgbsplit", "deepfry", "posterize", "channelswap", "vhs", "crt",
+    )),
+    ("TIME & MEMORY", (
+        "trails", "timescratch", "sediment", "dropout",
+    )),
+    ("CODEC & BLOCKS", (
+        "datamosh", "blockswap", "crunch",
+    )),
+)
+_grouped_effect_keys = tuple(key for _title, keys in EFFECT_GROUPS
+                             for key in keys)
+if (len(_grouped_effect_keys) != len(set(_grouped_effect_keys))
+        or set(_grouped_effect_keys) != set(EFFECT_BY_KEY)):
+    raise ValueError("EFFECT_GROUPS must list each registered effect exactly once")
 
 
 def build_plan(effect: Effect, ctx: EffectContext) -> Plan:
@@ -2179,28 +2261,57 @@ def _bar(fraction: float, cells: int = 24) -> str:
 
 
 def run_encode(cmd: list, duration: Optional[float], on_progress,
-               animate: bool) -> tuple:
-    """returns (returncode, stderr_text, elapsed)"""
+               animate: bool, input_writer: Optional[Callable] = None) -> tuple:
+    """Run the common FFmpeg encoder, optionally streaming frames into stdin."""
     start = time.time()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, bufsize=1)
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE if input_writer is not None else None,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     out = proc.stdout
     errp = proc.stderr
     if out is None or errp is None:  # pragma: no cover - pipes always requested
         raise RuntimeError("ffmpeg pipes unavailable")
     stderr_lines = []
+    feed_errors = []
+    feed_stop = threading.Event()
+    feeder = None
 
     def drain():
         for line in errp:
-            stderr_lines.append(line.rstrip())
+            stderr_lines.append(line.decode("utf-8", "replace").rstrip())
 
     pump = threading.Thread(target=drain, daemon=True)
     pump.start()
 
+    if input_writer is not None:
+        stream = proc.stdin
+        if stream is None:
+            proc.terminate()
+            proc.wait()
+            pump.join(timeout=2)
+            raise RuntimeError("ffmpeg input pipe unavailable")
+
+        def feed():
+            try:
+                input_writer(stream, feed_stop)
+            except Exception as exc:
+                feed_errors.append(str(exc))
+                feed_stop.set()
+            finally:
+                try:
+                    stream.close()
+                except (BrokenPipeError, OSError) as exc:
+                    if not feed_errors:
+                        feed_errors.append(str(exc))
+
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
+
     try:
-        for line in out:
+        for raw_line in out:
             if not animate:
                 continue
+            line = raw_line.decode("ascii", "ignore")
             key, _, value = line.strip().partition("=")
             if key in ("out_time_us", "out_time_ms"):
                 try:
@@ -2212,16 +2323,229 @@ def run_encode(cmd: list, duration: Optional[float], on_progress,
                 on_progress(duration or 0, duration, time.time() - start)
         proc.wait()
     except KeyboardInterrupt:
+        feed_stop.set()
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
+        if feeder is not None:
+            feeder.join(timeout=5)
         pump.join(timeout=2)
         raise
 
+    if feeder is not None:
+        feeder.join(timeout=10)
+        if feeder.is_alive():
+            feed_stop.set()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            feeder.join(timeout=2)
+            feed_errors.append("frame producer did not stop after FFmpeg exited")
     pump.join(timeout=5)
-    return proc.returncode, "\n".join(stderr_lines), time.time() - start
+    returncode = proc.returncode or 0
+    if feed_errors and returncode == 0:
+        returncode = 1
+    error_text = "\n".join(stderr_lines + feed_errors)
+    return returncode, error_text, time.time() - start
+
+
+def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tools,
+                       args, dst: Path, run_encode_fn: Callable,
+                       on_progress, animate) -> tuple:
+    """stream RGB frames through bounded stateful processors between FFmpeg filters."""
+    stateful_positions = [i for i, effect in enumerate(chain.effects)
+                          if effect.frame_processor is not None]
+    if not stateful_positions:
+        return False, "no stateful frame processor in this chain", 0.0
+    first, last = stateful_positions[0], stateful_positions[-1]
+    if any(chain.effects[i].frame_processor is None
+           for i in range(first, last + 1)):
+        return (False,
+                "stateful effects must be adjacent in a chain for now; "
+                "place FFmpeg effects before or after the stateful group",
+                0.0)
+    if not tools.ffprobe or not clip.width or not clip.height:
+        return False, "ffprobe is required for stateful frame effects", 0.0
+    try:
+        import numpy as np
+    except ImportError:
+        return False, ("Temporal Sediment needs NumPy; install "
+                       "requirements-stateful.txt"), 0.0
+
+    plans = chain_plans(chain, ctx)
+    merged = merge_plans(plans, ctx, (0, 0))
+    width, height = _source_dims(clip)
+    for _effect, plan in plans[:first]:
+        if plan.width and plan.height:
+            width, height = plan.width, plan.height
+    if not width or not height:
+        return False, "could not determine the stateful frame dimensions", 0.0
+    fps = _fps_number(clip)
+    fps_text = f"{fps:g}"
+    processors = []
+    try:
+        for index in stateful_positions:
+            effect, _plan = plans[index]
+            factory = effect.frame_processor
+            processor = factory()
+            opts = opts_of(ctx.opts, effect)
+            seed = int(opts.get("seed", 0) or 0)
+            if not seed:
+                seed = 20261023 + (clip.size % 1000003)
+            processor.initialize(opts, (height, width, 3), fps, seed)
+            processors.append(processor)
+    except Exception as exc:
+        return False, f"could not initialize {chain.name}: {exc}", 0.0
+
+    prefix = ",".join(p.vf for e, p in plans[:first]
+                      if p.vf and e.frame_processor is None)
+    suffix = ",".join(p.vf for e, p in plans[last + 1:]
+                      if p.vf and e.frame_processor is None)
+    decode_filters = [prefix] if prefix else []
+    decode_filters += [f"fps={fps_text}", "format=rgb24"]
+    decode_cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-i",
+                  str(clip.path), "-map", "0:v:0", "-vf",
+                  ",".join(decode_filters), "-an", "-fps_mode", "passthrough",
+                  "-f", "rawvideo", "-pix_fmt", "rgb24", "-s",
+                  f"{width}x{height}", "pipe:1"]
+
+    encode_cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
+                  "-f", "rawvideo", "-pixel_format", "rgb24",
+                  "-video_size", f"{width}x{height}", "-framerate", fps_text,
+                  "-i", "pipe:0"]
+    if clip.audio:
+        encode_cmd += ["-i", str(clip.path)]
+    encode_cmd += merged.in_extra
+    if suffix:
+        encode_cmd += ["-vf", suffix]
+    encode_cmd += ["-map", "0:v:0"]
+    if clip.audio:
+        if merged.af:
+            encode_cmd += ["-af", merged.af]
+        encode_cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", "192k",
+                       "-ac", "2"]
+    else:
+        encode_cmd += ["-an"]
+    encode_cmd += ["-c:v", "libx264", "-preset", ctx.preset]
+    if not merged.abr:
+        encode_cmd += ["-crf", str(ctx.crf)]
+    encode_cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    encode_cmd += merged.out_extra
+    encode_cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error",
+                   str(dst)]
+
+    def read_frame(pipe, size: int) -> bytes:
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = pipe.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def stop(proc) -> None:
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    def feed_frames(encoder_input, stop_event) -> None:
+        decoder = None
+        decoder_errors = []
+        error_thread = None
+
+        def drain_decoder(pipe):
+            for line in iter(pipe.readline, b""):
+                decoder_errors.append(line.decode("utf-8", "replace").rstrip())
+
+        try:
+            decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, bufsize=0)
+            decode_out, decode_err = decoder.stdout, decoder.stderr
+            if decode_out is None or decode_err is None:
+                raise RuntimeError("FFmpeg decoder pipes unavailable")
+            error_thread = threading.Thread(
+                target=drain_decoder, args=(decode_err,), daemon=True)
+            error_thread.start()
+            index = 0
+            frame_bytes = width * height * 3
+            while not stop_event.is_set():
+                raw = read_frame(decode_out, frame_bytes)
+                if stop_event.is_set():
+                    break
+                if not raw:
+                    break
+                if len(raw) != frame_bytes:
+                    raise RuntimeError("decoder returned a partial RGB frame")
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                    (height, width, 3))
+                timestamp = index / fps
+                for processor in processors:
+                    frame = processor.process(
+                        frame, index, timestamp,
+                        {"clip": clip, "fps": fps, "frame_index": index},
+                    )
+                if (not isinstance(frame, np.ndarray)
+                        or frame.shape != (height, width, 3)
+                        or frame.dtype != np.uint8):
+                    raise RuntimeError(
+                        "stateful processor returned an invalid RGB frame")
+                payload = memoryview(np.ascontiguousarray(frame)).cast("B")
+                while payload and not stop_event.is_set():
+                    written = encoder_input.write(payload)
+                    if written is None or written <= 0:
+                        if stop_event.is_set():
+                            break
+                        raise BrokenPipeError(
+                            "FFmpeg encoder stopped reading frames")
+                    payload = payload[written:]
+                index += 1
+            if stop_event.is_set():
+                stop(decoder)
+                return
+            decode_rc = decoder.wait()
+            error_thread.join(timeout=5)
+            stderr = "\n".join(decoder_errors)
+            if decode_rc != 0:
+                raise RuntimeError(stderr or f"FFmpeg decoder exited {decode_rc}")
+            if index == 0:
+                raise RuntimeError("decoder produced no video frames")
+        except Exception as exc:
+            stop(decoder)
+            if error_thread is not None:
+                error_thread.join(timeout=2)
+            detail = f"stateful frame decode failed: {exc}"
+            if decoder_errors:
+                detail += "\n" + "\n".join(decoder_errors)
+            raise RuntimeError(detail) from exc
+        finally:
+            if decoder is not None:
+                for pipe in (decoder.stdin, decoder.stdout, decoder.stderr):
+                    if pipe is not None and not pipe.closed:
+                        try:
+                            pipe.close()
+                        except OSError:
+                            pass
+                if decoder.poll() is None:
+                    stop(decoder)
+
+    returncode, stderr, elapsed = run_encode_fn(
+        encode_cmd, clip.duration, on_progress, animate,
+        input_writer=feed_frames,
+    )
+    return returncode == 0, stderr, elapsed
 
 
 def drop_partial(dst: Path, source: Path) -> None:
@@ -2240,8 +2564,8 @@ def render_preview(chain: Chain, clip: Clip, tools: Tools, args,
     returns (ok: bool, name_or_error: str). uses the same pipeline as a full
     render, just with a seek and a cap on the duration.
     """
-    if chain.multi_pass is not None:
-        return False, "preview is single-pass only - use r to render"
+    if chain.multi_pass is not None or chain.stateful_effects:
+        return False, "preview is not available for stateful or multi-pass effects"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ctx = EffectContext(clip=clip, width=args.width, height=args.height,
                         suffix=args.suffix, crf=args.crf, preset=args.preset,
@@ -2354,12 +2678,19 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
                 length = float(ctx.opts.get("second_length", 0.0))
                 render_duration += length or max(
                     0.0, float(second_clip.duration or 0.0) - start)
+    elif chain.stateful_effects:
+        def stateful_runner(run_ctx, run_clip, run_tools, run_args, run_dst,
+                            run_encode, on_progress, animate):
+            return run_stateful_chain(chain, run_ctx, run_clip, run_tools,
+                                      run_args, run_dst, run_encode,
+                                      on_progress, animate)
+        runner = stateful_runner
     cmd: list = []
     if runner is not None:
         if args.dry_run:
             for line in chain.stage_lines:
                 _say("  " + line)
-            if pass_effect.key == "datamosh":
+            if pass_effect is not None and pass_effect.key == "datamosh":
                 for param in pass_effect.params:
                     value = opts_of(opts, pass_effect)[param.key]
                     _say(f"  {param.key}={param.display(value)}")
@@ -2368,6 +2699,12 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
                     second_raw, Path(args.input_dir), clip.path)
                 if second_path:
                     _say("  second source: " + str(second_path))
+            elif chain.stateful_effects:
+                for effect in chain.stateful_effects:
+                    values = opts_of(opts, effect)
+                    for param in effect.params:
+                        _say(f"  {effect.key}.{param.key}="
+                             f"{param.display(values[param.key])}")
             return True
     else:
         cmd, plan = build_command(chain, ctx, clip, tools, dst)
@@ -2376,42 +2713,89 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
             return True
 
     animate = (not args.json) and (not _QUIET) and sys.stdout.isatty()
-    last = {"len": 0}
+    fps_value = _fps_number(clip)
+
+    def draw_render_monitor(done: float, total: Optional[float],
+                            elapsed: float) -> None:
+        duration = total or render_duration or None
+        fraction = (max(0.0, min(1.0, done / duration))
+                    if duration else 0.0)
+        percent = int(fraction * 100)
+        cells = max(12, min(34, term_cols() - 32))
+        filled = min(cells, int(round(fraction * cells)))
+        cursor = ">" if filled < cells else ""
+        bar = ("[" + C_FROST + "=" * filled + cursor + NC
+               + C_DIM + "." * (cells - filled - len(cursor)) + NC + "]")
+        if duration:
+            total_frames = int(round(duration * fps_value))
+            current_frames = min(total_frames,
+                                 max(0, int(round(done * fps_value))))
+            frames_text = f"~{current_frames:,} / ~{total_frames:,} frames"
+        else:
+            frames_text = f"~{int(max(0.0, done) * fps_value):,} frames"
+        speed = done / elapsed if elapsed > 0 and done > 0 else 0.0
+        remaining = ((max(0.0, duration - done) / speed)
+                     if duration and speed > 0 else None)
+        if not duration:
+            remaining_text = "unknown"
+        else:
+            remaining_text = human_time(remaining) if remaining is not None \
+                else "estimating"
+        if elapsed < 0.35 and done <= 0:
+            activity = "initializing FFmpeg and effect stages"
+        elif duration and done >= duration - 0.25:
+            activity = "flushing the video and audio streams"
+        else:
+            activity = "processing frames and writing the render"
+        engine = ("stateful CPU frame pass" if chain.stateful_effects
+                  else "effect-specific passes" if chain.multi_pass is not None
+                  else "FFmpeg filters")
+        flow = trunc("[SOURCE] -> [EFFECTS] -> [ENCODE] -> [OUTPUT]",
+                     term_cols() - 6)
+        full_body = [
+            kv("input", trunc(clip.path.name, term_cols() - 20), 10),
+            kv("effect", chain.name, 10),
+            kv("output", trunc(dst.name, term_cols() - 20), 10),
+            "",
+            "  " + B + C_FROST + flow.strip() + NC,
+            kv("pipeline", engine + "  ·  " + args.preset, 10),
+            "",
+            "  " + bar + f"  {percent:3d}%",
+            kv("frames", frames_text, 10),
+            kv("elapsed", human_time(elapsed), 10),
+            kv("remaining", "~" + remaining_text, 10),
+            kv("speed", f"{speed:.2f}x realtime" if speed else "warming up", 10),
+            "",
+            kv("now", activity, 10),
+            kv("source", f"{clip.res}  ·  {fps_value:g} fps", 10),
+            kv("source audio", clip.acodec or "none", 10),
+            kv("settings", option_line(chain, opts), 10),
+        ]
+        if term_rows() < 17:
+            body = [full_body[4], full_body[7], full_body[8],
+                    full_body[9] + "   " + full_body[10].strip(),
+                    full_body[13]]
+        elif term_rows() < 23 or term_cols() < 70:
+            body = [full_body[i] for i in
+                    (0, 1, 2, 3, 4, 7, 8, 9, 10, 13, 14, 15)]
+        else:
+            body = full_body
+        draw(build_frame(f"rendering  ·  {chain.name}", body,
+                         ["ctrl+c to cancel"],
+                         note=trunc(clip.path.name, 28)))
 
     def on_progress(done: float, total: Optional[float], elapsed: float) -> None:
-        if not animate:
-            return
-        if total:
-            frac = done / total
-            stamp = f"{human_time(done)} / {human_time(total)}"
-            pct = f"{int(frac * 100):3d}%"
-        else:
-            frac, stamp, pct = 0.0, human_time(elapsed), "  ?"
-        row = f"  {_bar(frac)}  {B}{pct}{NC}  {C_DIM}{stamp}{NC}"
-        sys.stdout.write("\r" + row + _CLEAR_EOL)
-        sys.stdout.flush()
-        last["len"] = vlen(row)
+        if animate:
+            draw_render_monitor(done, total, elapsed)
 
     if not args.json:
-        body = [
-            kv("input", trunc(str(clip.path), term_cols() - 14)),
-            kv("options", option_line(chain, opts)),
-            kv("output", trunc(str(dst), term_cols() - 14)),
-            "",
-        ]
-        start_frame(f"rendering  \u00b7  {chain.name}", body,
-                    ["ctrl+c to cancel"])
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        draw_render_monitor(0.0, clip.duration or render_duration or None, 0.0)
 
     if runner is not None:
         try:
             okk, stderr, elapsed = runner(ctx, clip, tools, args, dst,
                                           run_encode, on_progress, animate)
         except KeyboardInterrupt:
-            if animate:
-                sys.stdout.write("\r" + " " * last["len"] + "\r")
-                sys.stdout.flush()
             drop_partial(dst, clip.path)
             warn("cancelled, partial file removed")
             return False
@@ -2430,9 +2814,6 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
             rc, stderr, elapsed = run_encode(cmd, clip.duration, on_progress,
                                              animate)
         except KeyboardInterrupt:
-            if animate:
-                sys.stdout.write("\r" + " " * last["len"] + "\r")
-                sys.stdout.flush()
             drop_partial(dst, clip.path)
             warn("cancelled, partial file removed")
             return False
@@ -2443,10 +2824,6 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
             for line in stderr.splitlines()[-6:]:
                 print("    " + C_DIM + line + NC, file=sys.stderr)
             return False
-
-    if animate:
-        sys.stdout.write("\r" + " " * last["len"] + "\r")
-        sys.stdout.flush()
 
     if not dst.exists() or dst.stat().st_size == 0:
         err("ffmpeg reported success but no output was written")
@@ -2780,13 +3157,15 @@ def select(crumb: str, items: list, row_fn: Callable, keys: list,
            note: str = "", back_hint: str = "back",
            rescan: Optional[Callable] = None, notice: str = "",
            extra: Optional[dict] = None,
-           jump: Optional[dict] = None) -> object:
+           jump: Optional[dict] = None,
+           intro: Optional[list] = None) -> object:
     """arrow-key list. returns the picked value, or None to go back"""
     if not sys.stdin.isatty():
         return _select_numbered(crumb, items)
 
     idx, top = 0, 0
-    page = max(4, term_rows() - 8)
+    page = (max(1, term_rows() - 8 - len(intro)) if intro
+            else max(4, term_rows() - 8))
 
     while True:
         if idx < top:
@@ -2794,8 +3173,10 @@ def select(crumb: str, items: list, row_fn: Callable, keys: list,
         elif idx >= top + page:
             top = idx - page + 1
         visible = items[top:top + page]
-        body = [row_fn(item, top + n, (top + n) == idx)
-                for n, item in enumerate(visible)]
+        body = [row(line, False) for line in (intro or [])] + [
+            row_fn(item, top + n, (top + n) == idx)
+            for n, item in enumerate(visible)
+        ]
         if len(items) > page:
             body.append("  " + C_DIM
                         + f"\u2026 {len(items) - top - len(visible)} more" + NC)
@@ -2858,14 +3239,19 @@ def screen_main(tools: Tools, args) -> str:
     bits = ["ffmpeg ok" if tools.ffmpeg else "ffmpeg missing",
             f"{videos} in input/", f"{count_renders()} in output/"]
     items = [
-        Item("process a video", hint="pick a file, set the options, render",
+        Item("process a video", hint="pick a clip, build an effect chain, render",
              value="process"),
-        Item("effects", hint=", ".join(e.name for e in EFFECTS),
+        Item("effects", hint="browse effect options and descriptions",
              value="effects"),
         Item("system check", hint="ffmpeg, ffprobe, folders", value="check"),
         Item("quit", hint="leave effex", value="quit"),
     ]
-    note = " \u00b7 ".join(bits)
+    intro = [
+        B + C_FROST + "[SOURCE] -> [EFFECTS] -> [OUTPUT]" + NC,
+        C_DIM + "pick a clip, shape a look, render it to output/" + NC,
+        "",
+    ]
+    note = "  ·  ".join(bits)
     if not videos:
         note = "input/ is empty \u00b7 " + note
 
@@ -2875,7 +3261,8 @@ def screen_main(tools: Tools, args) -> str:
 
     picked = select("main menu", items, row_fn, keys=["? help"], note=note,
                     back_hint="quit", extra={"?": "help"},
-                    jump={"p": 0, "e": 1, "c": 2, "q": 3})
+                    jump={"p": 0, "e": 1, "c": 2, "q": 3},
+                    intro=intro)
     return "quit" if picked is None else str(picked)
 
 
@@ -2890,7 +3277,7 @@ def screen_help(args) -> None:
         kv("", "\u2190\u2192 change a value in place", 12),
         kv("", "space chains an effect (chip 1, 2, 3 = run order)", 12),
         kv("", "c clears the chain, enter runs what you chipped", 12),
-        kv("", "numbers jump to a row", 12),
+        kv("", "numbers quick-pick an effect; [/] jumps between effect groups", 12),
         kv("", "p / e / c jump to a main menu entry", 12),
         kv("r", "rescan input/ while picking a video", 12),
         "",
@@ -2914,6 +3301,9 @@ def screen_effects_info(args) -> None:
                     + C_DIM + effect.blurb + NC)
         if effect.run is not None:
             body.append("      " + C_DIM + "own passes - cannot be chained"
+                        + NC)
+        elif effect.frame_processor is not None:
+            body.append("      " + C_DIM + "stateful CPU frame pass - bounded history"
                         + NC)
         for param in effect.params:
             extra = f"  {param.range_text()}" if param.range_text() else ""
@@ -3008,13 +3398,23 @@ NOT_CHAINABLE = "runs its own multi-pass pipeline - nothing to chain it with"
 
 
 def screen_pick_effects(clip: Clip) -> Optional[Chain]:
-    """pick one effect, or chain several with space (E3.3).
+    """pick a visual effect by section, or chain several with space."""
+    grouped_effects = []
+    items = []
+    visual_rows = []
+    selectable_positions = []
+    group_starts = []
+    for title, keys in EFFECT_GROUPS:
+        group_effects = [EFFECT_BY_KEY[key] for key in keys]
+        group_starts.append(len(grouped_effects))
+        visual_rows.append(("group", title, len(group_effects)))
+        for effect in group_effects:
+            ordinal = len(grouped_effects)
+            grouped_effects.append(effect)
+            items.append(Item(effect.name, hint=effect.blurb, value=effect))
+            selectable_positions.append(len(visual_rows))
+            visual_rows.append(("effect", ordinal))
 
-    space marks a row and the mark shows the order the chain runs in, enter
-    confirms. with nothing marked, enter on a row picks just that one, so the
-    old single-effect flow is still one keypress.
-    """
-    items = [Item(e.name, hint=e.blurb, value=e) for e in EFFECTS]
     note = (f"{trunc(clip.path.name, 30)} \u00b7 {clip.res}"
             + C_DIM + "  \u00b7 space chains several" + NC)
 
@@ -3022,13 +3422,18 @@ def screen_pick_effects(clip: Clip) -> Optional[Chain]:
         cols = term_cols()
         picked_effect = it.value if isinstance(it.value, Effect) else None
         count = len(picked_effect.params) if picked_effect else 0
-        text = ("  " + mark + " " + fit(it.label, 14) + "  "
-                + C_DIM + fit(it.hint, 36 if cols >= 96 else 0) + NC)
+        marker = C_FROST + ">" + NC if sel else " "
+        text = ("  " + mark + " " + marker + " "
+                + C_FROST + f"{index + 1:02d}" + NC
+                + " " + fit(it.label, 15) + "  "
+                + C_DIM + fit(it.hint, 34 if cols >= 96 else 0) + NC)
         if cols >= 96:
             text += C_DIM + f"{count} option"
             text += "" if count == 1 else "s"
             if picked_effect is not None and picked_effect.run is not None:
                 text += "  \u00b7 own passes"
+            elif picked_effect is not None and picked_effect.frame_processor is not None:
+                text += "  \u00b7 stateful"
             text += NC
         return row(text, sel)
 
@@ -3047,28 +3452,42 @@ def screen_pick_effects(clip: Clip) -> Optional[Chain]:
             return C_DIM + "\u00b7" + NC
         return C_FROST + B + str(order.index(effect) + 1) + NC
 
+    def group_for(effect_index: int) -> int:
+        return max(i for i, start in enumerate(group_starts)
+                   if start <= effect_index)
+
     while True:
-        if idx < top:
-            top = idx
-        elif idx >= top + page:
-            top = idx - page + 1
-        visible = items[top:top + page]
+        selected_row = selectable_positions[idx]
+        anchor = selected_row - 1 if idx in group_starts else selected_row
+        if anchor < top:
+            top = max(0, anchor)
+        if selected_row >= top + page:
+            top = selected_row - page + 1
+        visible = visual_rows[top:top + page]
         body = []
-        for n, item in enumerate(visible):
-            effect = cast(Effect, item.value)
-            body.append(row_fn(item, top + n, (top + n) == idx,
-                               marked(effect)))
-        if len(items) > page:
+        for visual_index, entry in enumerate(visible, top):
+            if entry[0] == "group":
+                _kind, title, count = entry
+                body.append("  " + B + C_FROST + title + NC + "  "
+                            + C_DIM + f"{count} effects" + NC)
+                continue
+            _kind, effect_index = entry
+            item = items[effect_index]
+            body.append(row_fn(item, effect_index,
+                               effect_index == idx,
+                               marked(cast(Effect, item.value))))
+        if len(visual_rows) > page:
             body.append("  " + C_DIM
-                        + f"\u2026 {len(items) - top - len(visible)} more" + NC)
+                        + f"\u2026 {len(visual_rows) - top - len(visible)} more rows"
+                        + NC)
         chain_note = (C_DIM + "chain " + NC + C_FROST
                       + " \u2192 ".join(e.name for e in order) + NC
                       + C_DIM + f"   {len(order)} effect"
                       + ("" if len(order) == 1 else "s") + NC) if order else ""
         banner = "   ".join(part for part in (chain_note, notice) if part)
         draw(build_frame("pick an effect", body,
-                         ["\u2191\u2193 move", "space chain", "enter ok",
-                          "c clear", "q videos"],
+                         ["\u2191\u2193 move", "[/] group", "1-9 pick",
+                          "space chain", "enter ok", "c clear", "q videos"],
                          note=note, notice=banner))
         try:
             key = read_one_key()
@@ -3076,11 +3495,15 @@ def screen_pick_effects(clip: Clip) -> Optional[Chain]:
             return None
         notice = ""
         if key in ("up", "k"):
-            idx = (idx - 1) % len(items)
+            idx = (idx - 1) % len(grouped_effects)
         elif key in ("down", "j"):
-            idx = (idx + 1) % len(items)
+            idx = (idx + 1) % len(grouped_effects)
+        elif key in ("[", "{"):
+            idx = group_starts[(group_for(idx) - 1) % len(group_starts)]
+        elif key in ("]", "}"):
+            idx = group_starts[(group_for(idx) + 1) % len(group_starts)]
         elif key == " ":
-            effect = cast(Effect, items[idx].value)
+            effect = grouped_effects[idx]
             if effect in order:
                 order = [e for e in order if e is not effect]
             elif effect.run is not None:
@@ -3094,11 +3517,11 @@ def screen_pick_effects(clip: Clip) -> Optional[Chain]:
         elif key in ("\r", "\n"):
             if order:
                 return Chain(tuple(order))
-            return one(cast(Effect, items[idx].value))
+            return one(grouped_effects[idx])
         elif key in ("q", "esc", "\x03"):
             return None
-        elif key.isdigit() and 1 <= int(key) <= min(9, len(items)):
-            return one(cast(Effect, items[int(key) - 1].value))
+        elif key.isdigit() and 1 <= int(key) <= min(9, len(grouped_effects)):
+            return one(grouped_effects[int(key) - 1])
 
 
 @dataclass
@@ -3218,7 +3641,7 @@ def screen_effect_options(chain: Chain, clip: Clip, tools: Tools, args,
 
         keys = ["\u2191\u2193 row", "\u2190\u2192 change",
                 "enter edit", "r render", "q back"]
-        if chain.multi_pass is None:
+        if chain.multi_pass is None and not chain.stateful_effects:
             keys.insert(-1, "p preview")
         draw(build_frame(f"{chain.name if chain.single else chain.key} options",
                          body, keys,
@@ -3231,7 +3654,7 @@ def screen_effect_options(chain: Chain, clip: Clip, tools: Tools, args,
 
         if key == "r":
             return opts
-        if key == "p":
+        if key == "p" and chain.multi_pass is None and not chain.stateful_effects:
             try:
                 made, name = render_preview(chain, clip, tools, args, opts)
             except Exception as exc:      # never let a preview kill the menu
@@ -3351,6 +3774,8 @@ def screen_confirm(chain: Chain, clip: Clip, args, opts: dict) -> bool:
         encode = (f"mpeg4  grit {mosh_opts.get('grit', 2)}  "
                   f"gop {mosh_opts.get('hold', 150)}  -> video copy")
         audio_description = str(mosh_opts.get("audio", "auto"))
+    elif chain.stateful_effects:
+        encode = f"CPU frame pass  ->  libx264  crf {args.crf}  preset {args.preset}"
     body = [
         kv("input", trunc(str(clip.path), width - 8)),
         kv("effect", chain.name if chain.single

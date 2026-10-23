@@ -43,7 +43,9 @@ def main() -> int:
                                           "slow + pitch", "crt",
                                           "channelswap", "blockswap",
                                           "dropout", "crunch",
-                                          "timescratch", "block size")),
+                                          "timescratch", "block size",
+                                          "temporal sediment", "deposit rate",
+                                          "excavation chance")),
             text[:200])
     c.check("--list shows option defaults", "default" in text)
 

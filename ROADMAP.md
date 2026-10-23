@@ -4,10 +4,10 @@ purpose: pick one item per session, finish it end-to-end (code + test + docs),
 then check it off with a done note saying what actually landed.
 format: `[ ]` open, `[x]` done, done notes indented under the item.
 state: input/ holds source videos, output/ holds renders and previews, effex.py
-is the tool (v0.11.0, 19 effects, chains of two or more), tests/ has five
+is the tool (v0.12.0, 20 effects, chains of two or more), tests/ has six
 suites. verify before closing an item with:
 
-    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install
+    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install + stateful
     python3 tests/make_clip.py        # drop a lavfi test clip into input/
     ./install.sh                      # effex onto ~/.local/bin
 
@@ -333,6 +333,51 @@ decision.
       the now-pieces - channel lobotomy + neon hue cycle + strobe gates +
       tblend hardmix + grain - the default bleood look, with an intensity
       knob scaling how many pieces join the chain
+
+### stateful glitch effects
+
+Six effects from the requested design prompt. Temporal Sediment is implemented; the remaining five are checklist items, not implementations.
+
+Shared rules for the stateful effects:
+- Trace how `effex.py` scans/probes clips, builds `Plan`s, invokes custom runners, and encodes output. The core stays FFmpeg-filter based; Temporal Sediment adds a narrow per-frame adapter for stateful effects.
+- Reuse the stateful frame adapter added for Temporal Sediment; do not build a second decoder/export path. Keep every effect's config separate from its runtime state and reset state on a new clip or explicit reset.
+- Preserve dimensions and pixel format, avoid mutating shared frames, bound memory, handle first/short clips and scene cuts, and use timestamps where available.
+- Make effects independently configurable and reorderable in a chain. Keep each history buffer owned by its effect; share flow or metadata only with clear ownership.
+- Keep a CPU implementation. Consider NumPy/OpenCV only when needed; no GPU or downloaded ML models.
+- Register options through the existing effect model. Persist settings only, not temporal state. Add validation and concise docs. Do not mark a placeholder as done.
+- For each effect, test frame shape/channels/dtype, input mutation, first/short/static/scene-cut behavior, off/zero-intensity passthrough, parameter bounds, fixed-seed repeatability, and bounded memory. Test variable timestamps where the pipeline supports them.
+- Add one integration test chaining all six in user-selected order. Benchmark each at 640x360 and 1280x720 for frame time and peak memory; do not call it real-time until measured.
+
+- [x] E2.44 - temporal sediment (prompt effect 01): accumulate visual history instead of making a simple motion trail.
+  - Maintain one bounded float buffer or a small set of layers with different decay rates. Deposit each frame at a configurable rate and normalize/clamp the accumulated result so brightness cannot grow without limit.
+  - Use motion, edges, brightness, or a slowly changing mask to control deposition. Add excavation that reveals or removes saved history; it must expose actual history, not just add random noise.
+  - Options: intensity, deposit rate, decay rate, motion sensitivity, and excavation chance use 0-100 percent values; bound layer count and excavation size. Add color-memory and seed controls.
+  - Test static-scene stability, recognizable trails from a moving shape, visible deposit/decay changes, excavation of older content, and a reset that clears state.
+  _Done: registered `sediment` as a CPU stateful frame processor. It keeps 1-3 float16 decay layers within a 128 MiB state budget, downscales history for large sources, supports motion-weighted deposit, seeded excavation and color memory, resets on explicit reset/scene cut/rewind, and composes with FFmpeg filters before or after it. Tests cover bounds, repeatability, frame shape, no mutation, decay, reset, scene cuts, timestamps, actual renders, chaining and audio. VFR inputs are normalized to the probed FPS; original per-frame PTS is not retained._
+- [ ] E2.45 - frame debt (prompt effect 03): let motion events borrow frames and repay them later.
+  - Start with a normalized frame-difference score; add optical flow only if the simple detector is insufficient. Use a threshold with hysteresis or cooldown so small changes do not retrigger continuously.
+  - On a motion event, queue a bounded frame or patch snapshot with a due timestamp. Release delayed frames or short repayment bursts without blocking the render loop. Handle clip end when queued debt remains.
+  - Options: motion threshold/sensitivity, min/max delay, debt gain, release rate, burst size, freeze chance, patch mode, queue capacity, seed.
+  - Test that static input creates little debt, a sudden moving shape triggers delayed output, sensitivity and release controls change behavior, fixed seeds repeat, and queue memory stays bounded.
+- [ ] E2.46 - content-aware elastic collapse (prompt effect 05): deform the image nonuniformly while keeping the output dimensions fixed.
+  - Make real-time elastic remapping the default: evolve a smooth displacement/scale field, then sample with a CPU remap such as `cv2.remap` if OpenCV is justified. Do not reduce this to uniform zoom.
+  - Keep seam carving as an optional offline mode: use a gradient/energy map, work at reduced resolution, limit seams per update, smooth decisions over time, then resize to the required frame size. Do not carve every full-resolution frame without measuring flicker and cost.
+  - Options: intensity, horizontal/vertical scale, content preservation, seam strength/mode, motion influence, field smoothness/speed, temporal coherence, seed.
+  - Test fixed output size, stronger deformation at higher intensity, repeatability for a fixed seed, and less incidental flicker with temporal smoothing. Benchmark real-time and seam modes separately.
+- [ ] E2.47 - pixel archaeology (prompt effect 09): transplant patches from earlier frames using content matching.
+  - Keep a bounded reservoir of old frames or patches. Cache inexpensive descriptors such as color mean/variance, gradient histograms, or downsampled pixels; sample candidates instead of searching every patch in every frame.
+  - Match current regions to historical patches by color, texture, or edge compatibility. Include a controlled mismatch mode. Support hard copy and soft/feathered boundaries; every replacement must come from actual video history, not random rectangles.
+  - Options: history capacity/seconds, patch size, candidates per frame, analysis interval, match metric/threshold, mismatch strength, replacement chance, boundary mode, displacement, seed.
+  - Test patch provenance, distinct matching modes, zero-intensity passthrough, deterministic selection, and bounded history memory.
+- [ ] E2.48 - anti-motion compensation (prompt effect 15): estimate motion, then amplify it instead of stabilizing it.
+  - Reuse a shared flow field if the pipeline can safely provide one; otherwise estimate dense flow from previous/current grayscale frames at a configurable analysis resolution, starting with Farneback flow if OpenCV is accepted. Smooth and clamp vectors, apply a tunable gain, and remap the current frame. Verify the displacement sign with a synthetic moving shape before tuning the look.
+  - Options: flow gain, nonlinear gain, motion threshold, analysis resolution, smoothing, max displacement, optional trail amount/decay, seed for randomized modulation.
+  - Handle the first frame without history. Test direction/sign, stronger displacement at higher gain, relative stability on static footage, valid shape/dtype, and CPU cost.
+- [ ] E2.49 - causality inversion (prompt effect 20): let selected regions borrow pixels from later video frames.
+  - Use a bounded look-ahead buffer of frames and timestamps. Start with future-frame blend and replacement; add region tearing or motion alignment as separate modes. Preserve output timestamps and dimensions.
+  - Document the look-ahead delay. Live input cannot provide genuine future frames without buffering or prediction. Near clip end, reduce the blend or use the latest available frame.
+  - Options: look-ahead seconds, blend/replacement strength, offset, region/mask mode, mask speed, motion alignment, edge feather, seed.
+  - Test that a moving synthetic object appears early by the configured offset, blend and replacement differ, unavailable future frames take the documented fallback, and memory/timestamps remain bounded and valid.
 
 ---
 
