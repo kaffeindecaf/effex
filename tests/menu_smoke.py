@@ -614,7 +614,8 @@ def scenario_timescratch(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 14)                              # timescratch, effect 15
+    next_effect_group(d, 2)                         # time & memory group
+    d.send(DOWN)                                   # timescratch
     d.send(ENTER)
     c.check("timescratch options open", d.wait_for("timescratch options"))
     c.check("timescratch rows are shown", "curve" in d.text()
@@ -644,7 +645,8 @@ def scenario_temporal_sediment(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 15)                              # temporal sediment, effect 16
+    next_effect_group(d, 2)                         # time & memory group
+    d.send(DOWN * 2)                               # temporal sediment
     d.send(ENTER)
     c.check("temporal sediment options open",
             d.wait_for("temporal sediment options"))
@@ -776,6 +778,49 @@ def scenario_chain(c: Checker):
     d.close()
 
 
+def scenario_psychedelic(c: Checker):
+    """both new color effects can be tuned, previewed and rendered"""
+    from harness import newest_mp4
+
+    for offset, name, label, tuned in (
+            (6, "channel lobotomy", "red levels", "16 levels"),
+            (7, "neon hue cycle", "hue swing", "130")):
+        in_dir, out_dir = temp_folders()
+        make_clip(in_dir / "clip.mp4", seconds=1, size="160x90")
+        d = start(env_for(in_dir, out_dir))
+        try:
+            d.wait_for("main menu")
+            d.send(b"p")
+            d.wait_for("pick a video")
+            d.send(ENTER)
+            d.wait_for("pick an effect")
+            next_effect_group(d)
+            d.send(DOWN * offset)
+            d.send(ENTER)
+            c.check(f"{name} options open", wait_last(d, f"{name} options"))
+            c.check(f"{name} exposes its controls", label in last_frame(d))
+            press_and_wait(d, RIGHT)
+            c.check(f"{name} can be tuned", tuned in last_frame(d))
+            d.send(b"p")
+            c.check(f"{name} preview succeeds",
+                    wait_last(d, "preview wrote", timeout=30))
+            d.send(b"r")
+            c.check(f"{name} reaches confirmation",
+                    wait_last(d, "render this video?"))
+            d.send(ENTER)
+            c.check(f"{name} render succeeds", wait_last(d, "wrote", timeout=30))
+            out = newest_mp4(out_dir)
+            c.check(f"{name} preserves dimensions and audio",
+                    out is not None and "PREVIEW" not in out.name
+                    and video_dims(out) == (160, 90) and audio_codec(out) == "aac")
+            d.send(ENTER)
+            wait_last(d, "main menu")
+            d.send(b"q")
+            c.check(f"{name} exits cleanly", d.expect_exit(6) == 0)
+        finally:
+            d.close()
+
+
 def main() -> int:
     c = Checker("menu smoke")
     if not require_tools(c):
@@ -786,7 +831,7 @@ def main() -> int:
                      scenario_datamosh_second, scenario_newkinds,
                      scenario_vhs, scenario_channelswap,
                      scenario_timescratch, scenario_temporal_sediment,
-                     scenario_chain, scenario_backout):
+                     scenario_chain, scenario_psychedelic, scenario_backout):
         print(f"  -- {scenario.__name__}")
         scenario(c)
     return c.summary()

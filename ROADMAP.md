@@ -4,10 +4,10 @@ purpose: pick one item per session, finish it end-to-end (code + test + docs),
 then check it off with a done note saying what actually landed.
 format: `[ ]` open, `[x]` done, done notes indented under the item.
 state: input/ holds source videos, output/ holds renders and previews, effex.py
-is the tool (v0.12.0, 20 effects, chains of two or more), tests/ has six
+is the tool (v0.12.0, 22 effects, chains of two or more), tests/ has seven
 suites. verify before closing an item with:
 
-    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install + stateful
+    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install + stateful + psychedelic
     python3 tests/make_clip.py        # drop a lavfi test clip into input/
     ./install.sh                      # effex onto ~/.local/bin
 
@@ -29,6 +29,8 @@ suites. verify before closing an item with:
       lobotomy (E2.29), strobe gates (E2.30), neon hue cycle (E2.31), heat
       palette (E2.37), tblend madness (E2.38), slice tears via geq (E2.42),
       then the trip stack (E2.43) chains them - the first bleood-look render
+  _Partial: channel lobotomy (E2.29) and neon hue cycle (E2.31) now ship;
+  the remaining pieces and trip stack are still open._
 - [ ] E0.9 - the E3.1 unlock (filter_complex): feedback loop (E2.32),
       kaleidoscope (E2.19), slice shuffle (E2.20), glow (E2.22), slitscan
       (E2.35) all wait on it - decide the Plan shape first, ~1 session
@@ -282,15 +284,27 @@ stock ffmpeg; (E3.1) = needs the filter_complex engine; (multipass) = the
 timescratch/datamosh run-callback pattern; (numpy) = needs the pixel-math
 decision.
 
-- [ ] E2.29 - channel lobotomy (now): bitcrush each channel
+- [x] E2.29 - channel lobotomy (now): bitcrush each channel
       (`lutrgb=r=floor(val/Q)*Q:g=...:b=...`), kill a channel
       (`colorchannelmixer` zero), swap them - the "lobotomized chroma" look
       from videoglitchcrazynes. chain the three knobs into one builder
+  _Done: `lobotomy` has independent RGB level controls (2-256), optional
+  source-channel kill, and channel swaps applied after crushing/killing.
+  Reuses the existing swap matrices and single-pass pipeline. Pixel tests
+  verify quantization, every kill/swap mode and unchanged-color settings;
+  CLI and PTY tests cover validation, previews, real renders and chaining._
 - [ ] E2.30 - strobe / invert gates (now): time-gated negative flashes,
       `lutrgb=r='if(lt(mod(t,P),D),255-val,val)'` on all channels (verify
       lutrgb accepts t at build time), plus a white-out gate via eq
-- [ ] E2.31 - neon hue cycle (now): `hue=H*sin(2*PI*t/P)` + saturation
+- [x] E2.31 - neon hue cycle (now): `hue=H*sin(2*PI*t/P)` + saturation
       crush + a curves punch - the acid palette slowly rotating
+  _Done: `neon` uses `hue=h='A*sin(2*PI*t/P)'` (degrees), saturation and an
+  adjustable S-curve. Options cover 0-180 degree swing, 0.5-30 second cycle,
+  100-300% saturation and 0-100% punch, including a fully disabled setting.
+  Static-color tests prove time-varying hue and visible saturation/contrast;
+  real renders verify both chain orders, dimensions, timing and audio/silence.
+  Both new effects live in COLOR & TEXTURE with editable options and previews.
+  README updated; all seven test suites pass._
 - [ ] E2.32 - video feedback loop (E3.1): THE psychedelic core - split the
       frame, rotate by t degrees, scale ~1.02, blend back at ~0.55 decay,
       screen/add mode. the blob-tracker glossary has the exact math; the

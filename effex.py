@@ -1522,6 +1522,90 @@ def build_channelswap(ctx: EffectContext) -> Plan:
     )
 
 
+LOBOTOMY_LEVELS = tuple(
+    (str(n), f"{n} levels", "unchanged" if n == 256 else "fewer = harsher bands")
+    for n in (2, 4, 8, 16, 32, 64, 128, 256)
+)
+LOBOTOMY_PARAMS = (
+    Param("red", "red levels", "quantization levels for the red channel",
+          "choice", "8", choices=LOBOTOMY_LEVELS),
+    Param("green", "green levels", "quantization levels for the green channel",
+          "choice", "4", choices=LOBOTOMY_LEVELS),
+    Param("blue", "blue levels", "quantization levels for the blue channel",
+          "choice", "8", choices=LOBOTOMY_LEVELS),
+    Param("kill", "kill channel", "zero a source channel before swapping",
+          "choice", "g", choices=(
+              ("none", "none", "keep all channels"),
+              ("r", "red", "remove red"),
+              ("g", "green", "remove green"),
+              ("b", "blue", "remove blue"),
+          )),
+    Param("swap", "swap", "trade channels after crushing and killing",
+          "choice", "rb", choices=(
+              ("none", "none", "keep channel order"),
+          ) + tuple(c for c in CHANNELSWAP_PARAMS[0].choices if c[0] != "invert")),
+)
+
+
+def build_lobotomy(ctx: EffectContext) -> Plan:
+    parts = ["format=rgb24"]
+    channels = []
+    for key, default in (("red", 8), ("green", 4), ("blue", 8)):
+        levels = _clamp_int(ctx.opts.get(key, default), default, 2, 256)
+        q = 256 // levels
+        channels.append(f"{key[0]}='floor(val/{q})*{q}'")
+    parts.append("lutrgb=" + ":".join(channels))
+    kill = str(ctx.opts.get("kill", "g"))
+    if kill in ("r", "g", "b"):
+        parts.append(f"colorchannelmixer={kill}{kill}=0")
+    swap = str(ctx.opts.get("swap", "rb"))
+    if swap in ("rb", "rg", "gb", "roll"):
+        parts.append(CHANNELSWAP_CCM[swap])
+    w, h = _source_dims(ctx.clip, ctx.frame)
+    return Plan(
+        vf=",".join(parts), out_suffix=ctx.suffix or "_LOBOTOMIZED",
+        width=w, height=h,
+        notes=["crush each RGB channel, kill a source channel, then swap",
+               "256 levels with no kill or swap leaves colors unchanged"],
+    )
+
+
+NEON_PARAMS = (
+    Param("amount", "hue swing", "maximum hue rotation in degrees",
+          "int", 120, minimum=0, maximum=180, step=10),
+    Param("period", "cycle seconds", "seconds for one full back-and-forth cycle",
+          "float", 4.0, minimum=0.5, maximum=30.0, step=0.5),
+    Param("saturation", "saturation", "100% is unchanged; higher crushes color",
+          "percent", 200, minimum=100, maximum=300, step=10),
+    Param("punch", "curve punch", "contrast curve strength; 0% disables it",
+          "percent", 50, minimum=0, maximum=100, step=5),
+)
+
+
+def build_neon(ctx: EffectContext) -> Plan:
+    amount = _clamp_int(ctx.opts.get("amount", 120), 120, 0, 180)
+    try:
+        period = float(ctx.opts.get("period", 4.0))
+    except (TypeError, ValueError):
+        period = 4.0
+    period = max(0.5, min(30.0, period))
+    saturation = _clamp_int(ctx.opts.get("saturation", 200), 200, 100, 300) / 100
+    punch = _clamp_int(ctx.opts.get("punch", 50), 50, 0, 100) / 100
+    parts = []
+    if amount or saturation != 1:
+        parts.append(f"hue=h='{amount}*sin(2*PI*t/{period:g})':s={saturation:g}")
+    if punch:
+        low, high = 0.25 - 0.15 * punch, 0.75 + 0.15 * punch
+        parts.append(f"curves=all='0/0 0.25/{low:g} 0.75/{high:g} 1/1'")
+    w, h = _source_dims(ctx.clip, ctx.frame)
+    return Plan(
+        vf=",".join(parts) or "null", out_suffix=ctx.suffix or "_NEON",
+        width=w, height=h,
+        notes=[f"hue swings +/-{amount} degrees over {period:g} seconds",
+               "saturated color and an adjustable S-curve contrast punch"],
+    )
+
+
 BLOCKSWAP_PARAMS = (
     Param("size", "block size", "how big the swapped blocks are "
            "(percent of the frame)", "int", 25, minimum=10, maximum=60,
@@ -1903,6 +1987,14 @@ EFFECTS = [
            blurb="circuit-bent rgb - channels trade places",
            tag="lutrgb channel swap, chromashift bleed",
            build=build_channelswap, params=CHANNELSWAP_PARAMS),
+    Effect(key="lobotomy", name="channel lobotomy",
+           blurb="crush, kill and swap individual color channels",
+           tag="lutrgb,colorchannelmixer",
+           build=build_lobotomy, params=LOBOTOMY_PARAMS),
+    Effect(key="neon", name="neon hue cycle",
+           blurb="swing through saturated acid colors with a contrast punch",
+           tag="hue=h=sin(2*PI*t/P),curves",
+           build=build_neon, params=NEON_PARAMS),
     Effect(key="blockswap", name="blockswap",
            blurb="two blocks slide through each other",
            tag="swaprect moving blocks",
@@ -1947,6 +2039,7 @@ EFFECT_GROUPS = (
     )),
     ("COLOR & TEXTURE", (
         "rgbsplit", "deepfry", "posterize", "channelswap", "vhs", "crt",
+        "lobotomy", "neon",
     )),
     ("TIME & MEMORY", (
         "trails", "timescratch", "sediment", "dropout",
