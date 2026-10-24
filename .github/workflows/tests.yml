@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'feat/**']
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      TMPDIR: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install ffmpeg and optional processors
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -r requirements-collapse.txt -r requirements-inversion.txt ruff
+      - name: check changed processor code
+        run: ruff check --select F frame_pipeline.py timestamped_frames.py stateful_effects.py tests/inversion_regression.py
+      - name: run every suite with optional dependencies present
+        run: python tests/run_tests.py

@@ -38,6 +38,11 @@ python3 -m pip install -r requirements-collapse.txt
 These packages are optional and loaded only when rendering stateful effects.
 Ordinary FFmpeg effects and `--list` still work without them.
 
+Causality inversion uses NumPy and PyAV to carry RGB frames with their original
+presentation timestamps. Install `requirements-inversion.txt`; its aligned mode
+also needs `requirements-collapse.txt` for CPU optical flow. Timestamped export
+uses FFmpeg's `-enc_time_base demux` option (tested with FFmpeg 7.1).
+
 ## commands
 
 ```sh
@@ -50,6 +55,7 @@ Ordinary FFmpeg effects and `--list` still work without them.
 ./effex.py sediment+deepfry input/clip.mp4 --set sediment.decay=30 --set sediment.color=warm --set deepfry.strength=60
 ./effex.py collapse input/clip.mp4 --set intensity=80 --set seed=17
 ./effex.py collapse input/clip.mp4 --set mode=seam --set seam_strength=80
+./effex.py inversion input/clip.mp4 --set lookahead=0.5 --set offset=0.3 --set region=bands
 ./effex.py datamosh input/a.mp4 --set second=input/b.mp4 --set cut=dice --set survival=50 --set seed=123
 ./effex.py stretch input/clip.mp4 --dry-run
 ```
@@ -64,7 +70,7 @@ Ordinary FFmpeg effects and `--list` still work without them.
 - datamosh can join two videos in one codec stream. pick the second clip in the menu or pass `--set second=path`; set the trim, keyframe survival, seed, fill, grit, and audio.
 - single-pass previews, render progress, ctrl-c cancellation, and cleanup of partial renders.
 
-datamosh and timescratch use their own multi-pass pipelines, so they cannot be chained with other effects. Temporal sediment uses a bounded 128 MiB history buffer. Stateful effects resample input to the probed frame rate, do not preserve original variable-rate timestamps, and have no preview yet. Multiple stateful processors must be adjacent; FFmpeg filters can go before and after them.
+datamosh and timescratch use their own multi-pass pipelines, so they cannot be chained with other effects. Temporal sediment uses a bounded 128 MiB history buffer. Without inversion, stateful chains still normalize input to the probed frame rate. Chains containing inversion use timestamped transport and preserve the video presentation timeline, including variable-rate input and nonzero start times. Stateful previews are not available. Multiple stateful processors must be adjacent; FFmpeg filters can go before and after them.
 
 ## channel lobotomy
 
@@ -168,6 +174,69 @@ averaged 6.68 ms at 360p and 12.87 ms at 720p. Persistent state was about
 0.38 MiB for elastic and 0.53 MiB for seam mode in these cases. These are
 measurements of this fixture on this host, not a promise for every input.
 
+## causality inversion
+
+`inversion` is under **TIME & MEMORY**. Selected regions borrow actual pixels
+from a later decoded frame. It never predicts or fabricates future content.
+
+| option | range / values | default |
+| --- | --- | --- |
+| `lookahead` | 0-5 seconds of buffer horizon | 0.5 |
+| `offset` | 0-lookahead seconds into the future | 0.5 |
+| `strength` | 0-100%, opacity or replacement coverage | 65% |
+| `mode` | blend, replace, tear, align | blend |
+| `region` | full, bands, blocks, patch | full |
+| `mask_speed` | 0-4 mask/tear cycles per second | 0.25 |
+| `alignment` | 0-100%, flow gain in align mode | 100% |
+| `feather` | 0-100%, region edge softness | 10% |
+| `seed` | 0-2147483647; 0 derives masks from source | 0 |
+
+Blend mixes current and future RGB values. Replace uses strength as seeded
+patch coverage, so half strength replaces some pixels rather than making all
+pixels half-transparent. Tear shifts horizontal bands from the future image.
+Align estimates reduced-resolution forward flow and samples the future image
+at those coordinates to bring it toward the current scene. All modes can use
+the same region masks and feathering; alignment only affects `mode=align`.
+
+The buffer adds up to `lookahead` seconds of video processing delay, plus one
+decoded frame used to determine packet duration. Output timestamps do not move.
+Live input cannot provide genuine future pixels without that buffering; the
+current CLI accepts files, not live streams. A future request uses the first
+available frame at or after the target time. Near EOF, or before a detected
+scene cut, it clamps to the latest available frame in that segment. The final
+frame therefore stays unchanged. Zero strength or zero offset passes through
+without keeping a look-ahead queue.
+
+Each inversion queue is capped at 128 frames and 128 MiB of persistent state.
+Transient RGB/float masks, alignment maps and encoder buffers are additional;
+the cap is not a limit on total process RSS.
+Impossible nominal-rate settings fail before decoding with a resize/lower-horizon
+hint. An unusually dense VFR burst can fill the queue; its oldest frame then
+uses the latest already-buffered future instead of exceeding the cap. Explicit
+reset, rewind, frame discontinuity or a new clip clears pending state. Scene
+cuts drain the old segment before starting the next, preventing future-scene
+pixels from leaking backward across cuts.
+
+The shared renderer keeps original rational video PTS through NUT RGB pipes,
+including chains with sediment or collapse in either adjacent order. Unfiltered
+AAC/MP3/AC3/EAC3/ALAC/Opus audio is stream-copied to avoid encoder priming shifts.
+Other audio codecs or chains with audio filters are encoded to AAC; encoder
+delay can apply. Temporal FFmpeg filters such as slowmo still deliberately
+change timestamps. Masks/flow use seconds for analysis; exported PTS stays exact.
+
+Tests cover early object appearance, mode differences, EOF/short/static clips,
+scene boundaries, resets, bounded queues, caller ownership, VFR/nonzero-start
+timestamps, copied audio packets, short pipe writes, cancellation and cleanup.
+Run `python3 tests/run_tests.py inversion` for the focused suite.
+
+`python3 tests/benchmark_inversion.py --frames 60 --output benchmarks/inversion.json`
+records each mode at 640x360 and 1280x720 in fresh workers. With a 0.5-second
+horizon at 30 fps, measured queue state was about 9.89 MiB at 360p and 39.55 MiB
+at 720p. At 720p, processor-only averages including EOF drain were 11.93 ms
+blend, 15.10 ms replace, 24.32 ms tear and 23.10 ms align. These exclude
+FFmpeg decode/encode and are not end-to-end real-time claims. The JSON records
+peak process RSS separately from bounded processor state.
+
 ## files and tests
 
 `input/` holds source clips. `output/` holds renders. Git ignores files in both folders except `.gitkeep`, so clips and renders stay local. Both paths can be changed with `--input-dir` / `--output-dir` or `EFFEX_INPUT_DIR` / `EFFEX_OUTPUT_DIR`.
@@ -178,6 +247,7 @@ run the test suite with:
 python3 tests/run_tests.py
 python3 tests/run_tests.py psychedelic  # pixel behavior, options and real renders
 python3 tests/run_tests.py collapse seams  # deformation, carving and shared pipeline
+python3 tests/run_tests.py inversion  # future pixels, original PTS and EOF fallback
 ```
 
 tests use generated clips and temporary folders; they do not overwrite files in `input/` or `output/`.
