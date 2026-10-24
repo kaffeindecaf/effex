@@ -874,6 +874,47 @@ def scenario_collapse(c: Checker):
             d.close()
 
 
+def scenario_inversion(c: Checker):
+    """Buffered future borrowing has editable controls and uses the same renderer."""
+    import importlib.util
+    from harness import newest_mp4
+    if importlib.util.find_spec("av") is None or importlib.util.find_spec("numpy") is None:
+        print("  SKIP inversion menu tests need requirements-inversion.txt")
+        return
+    in_dir, out_dir = temp_folders()
+    make_clip(in_dir / "clip.mp4", seconds=1, size="160x90")
+    d = start(env_for(in_dir, out_dir))
+    try:
+        d.wait_for("main menu")
+        d.send(b"p")
+        d.wait_for("pick a video")
+        d.send(ENTER)
+        d.wait_for("pick an effect")
+        next_effect_group(d, 2)
+        d.send(DOWN * 4)
+        d.send(ENTER)
+        c.check("inversion options open", wait_last(d, "inversion options"))
+        c.check("inversion exposes buffer and mask controls", all(
+            text in last_frame(d) for text in ("buffer horizon", "future offset",
+                                               "blend opacity", "region mask", "edge feather")))
+        press_and_wait(d, RIGHT)
+        c.check("lookahead is editable", "0.6" in last_frame(d))
+        c.check("buffered effect offers no unsupported preview", "p preview" not in last_frame(d))
+        d.send(b"r")
+        c.check("inversion confirm opens", wait_last(d, "render this video?"))
+        d.send(ENTER)
+        c.check("inversion menu render finishes", wait_last(d, "wrote", timeout=30))
+        out = newest_mp4(out_dir)
+        c.check("inversion menu render preserves dimensions and audio",
+                out is not None and video_dims(out) == (160, 90) and audio_codec(out) == "aac")
+        d.send(ENTER)
+        wait_last(d, "main menu")
+        d.send(b"q")
+        c.check("inversion exits cleanly", d.expect_exit(6) == 0)
+    finally:
+        d.close()
+
+
 def main() -> int:
     c = Checker("menu smoke")
     if not require_tools(c):
@@ -885,7 +926,7 @@ def main() -> int:
                      scenario_vhs, scenario_channelswap,
                      scenario_timescratch, scenario_temporal_sediment,
                      scenario_chain, scenario_psychedelic, scenario_collapse,
-                     scenario_backout):
+                     scenario_inversion, scenario_backout):
         print(f"  -- {scenario.__name__}")
         scenario(c)
     return c.summary()

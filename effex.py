@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, cast
 
-from stateful_effects import ElasticCollapse, TemporalSediment
+from stateful_effects import CausalityInversion, ElasticCollapse, TemporalSediment
 
 VERSION = "0.12.0"
 
@@ -1666,6 +1666,8 @@ def build_dropout(ctx: EffectContext) -> Plan:
     return Plan(
         vf=f"select='gt(random(0),{chance / 100:g})'",
         out_suffix="_DROPOUT",
+        # FFmpeg 6 defaults to CFR here and recreates frames that select removed.
+        out_extra=["-fps_mode", "vfr"],
         width=w,
         height=h,
         notes=[
@@ -1958,6 +1960,50 @@ def build_collapse(ctx: EffectContext) -> Plan:
     )
 
 
+INVERSION_PARAMS = (
+    Param("lookahead", "look-ahead secs", "buffer horizon in seconds; adds processing latency",
+          "float", 0.5, minimum=0, maximum=5, step=0.1),
+    Param("offset", "future offset", "seconds to borrow ahead; cannot exceed look-ahead",
+          "float", 0.5, minimum=0, maximum=5, step=0.1),
+    Param("strength", "strength", "blend opacity or replacement coverage",
+          "percent", 65, minimum=0, maximum=100, step=5),
+    Param("mode", "mode", "how future pixels enter the current image", "choice", "blend",
+          choices=(("blend", "blend", "mix current and future pixels"),
+                   ("replace", "replace", "replace seeded regions instead of mixing"),
+                   ("tear", "region tearing", "shift bands from the future frame"),
+                   ("align", "motion aligned", "warp future toward current with CPU flow"))),
+    Param("region", "region mask", "which regions may borrow future pixels", "choice", "full",
+          choices=(("full", "full frame", "every pixel"),
+                   ("bands", "bands", "moving horizontal stripes"),
+                   ("blocks", "blocks", "moving checker regions"),
+                   ("patch", "moving patch", "a drifting circular patch"))),
+    Param("mask_speed", "mask speed", "mask and tear cycles per second; 0 holds still",
+          "float", 0.25, minimum=0, maximum=4, step=0.1),
+    Param("alignment", "motion alignment", "flow gain in aligned mode; 0 disables alignment",
+          "percent", 100, minimum=0, maximum=100, step=5),
+    Param("feather", "edge feather", "soften region mask boundaries",
+          "percent", 10, minimum=0, maximum=100, step=5),
+    Param("seed", "random seed", "0 derives repeatable masks from the source",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_inversion(ctx: EffectContext) -> Plan:
+    lookahead = float(ctx.opts.get("lookahead", 0.5))
+    offset = float(ctx.opts.get("offset", 0.5))
+    if offset > lookahead:
+        raise ValueError("inversion offset must not exceed lookahead seconds")
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    return Plan(
+        vf="stateful causality inversion timestamped frame pass",
+        out_suffix=ctx.suffix or "_INVERTED", width=width, height=height,
+        notes=[f"buffers up to {lookahead:g}s to borrow {offset:g}s into the future",
+               "preserves video PTS, dimensions and compatible unfiltered audio packets",
+               "EOF/cuts clamp to latest frame; 128 MiB/128-frame buffer budget",
+               "requires requirements-inversion.txt; aligned mode also needs headless OpenCV"],
+    )
+
+
 EFFECTS = [
     Effect(key="stretch", name="stretch",
            blurb="squash the frame into another shape",
@@ -2074,6 +2120,14 @@ EFFECTS = [
                "evolve content-aware elastic field or bounded low-resolution seam map",
                "smooth displacement, CPU remap, encode with later filters and audio",
            )),
+    Effect(key="inversion", name="causality inversion",
+           blurb="borrow real pixels from buffered future frames",
+           tag="bounded look-ahead with timestamp-preserving RGB transport",
+           build=build_inversion, params=INVERSION_PARAMS,
+           frame_processor=CausalityInversion,
+           stages=("decode timestamped RGB frames through earlier FFmpeg filters",
+                   "buffer future frames, mix selected regions, clamp unavailable future at EOF",
+                   "encode on original video PTS with later filters and source audio")),
     Effect(key="sediment", name="temporal sediment",
            blurb="deposit frames into bounded, decaying visual history",
            tag="stateful Python frame processor",
@@ -2097,7 +2151,7 @@ EFFECT_GROUPS = (
         "lobotomy", "neon",
     )),
     ("TIME & MEMORY", (
-        "trails", "timescratch", "sediment", "dropout",
+        "trails", "timescratch", "sediment", "dropout", "inversion",
     )),
     ("CODEC & BLOCKS", (
         "datamosh", "blockswap", "crunch",
@@ -2363,6 +2417,10 @@ def apply_cli_opts(chain: Chain, args) -> tuple:
         if effect is None:
             return opts, (f"{chain.name} has no shape option for --size")
         opts[effect.key][shape_key(effect)] = f"{args.width}x{args.height}"
+    if "inversion" in opts:
+        mine = opts["inversion"]
+        if mine["offset"] > mine["lookahead"]:
+            return opts, "inversion offset must not exceed lookahead seconds"
     return opts, ""
 
 
@@ -2551,6 +2609,13 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
     except Exception as exc:
         return False, f"could not initialize {chain.name}: {exc}", 0.0
 
+    timestamped = any(getattr(p, "requires_timestamps", False) for p in processors)
+    if timestamped:
+        try:
+            import av  # noqa: F401 - dependency check before launching FFmpeg
+        except ImportError:
+            return False, "Causality Inversion needs requirements-inversion.txt (PyAV)", 0.0
+
     prefix = ",".join(p.vf for e, p in plans[:first]
                       if p.vf and e.frame_processor is None)
     suffix = ",".join(p.vf for e, p in plans[last + 1:]
@@ -2567,6 +2632,15 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
                   "-f", "rawvideo", "-pixel_format", "rgb24",
                   "-video_size", f"{width}x{height}", "-framerate", fps_text,
                   "-i", "pipe:0"]
+    if timestamped:
+        decode_cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error",
+                      "-nostats", "-copyts", "-i", str(clip.path), "-map", "0:v:0",
+                      "-vf", ",".join(([prefix] if prefix else []) + ["format=rgb24"]),
+                      "-an", "-c:v", "rawvideo", "-enc_time_base", "demux",
+                      "-fps_mode", "passthrough", "-avoid_negative_ts", "disabled",
+                      "-f", "nut", "pipe:1"]
+        encode_cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y", "-copyts",
+                      "-f", "nut", "-i", "pipe:0"]
     if clip.audio:
         encode_cmd += ["-i", str(clip.path)]
     encode_cmd += merged.in_extra
@@ -2576,14 +2650,19 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
     if clip.audio:
         if merged.af:
             encode_cmd += ["-af", merged.af]
-        encode_cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", "192k",
-                       "-ac", "2"]
+        if timestamped and not merged.af and clip.acodec in ("aac", "mp3", "ac3", "eac3", "alac", "opus"):
+            encode_cmd += ["-map", "1:a:0?", "-c:a", "copy"]
+        else:
+            encode_cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", "192k", "-ac", "2"]
     else:
         encode_cmd += ["-an"]
     encode_cmd += ["-c:v", "libx264", "-preset", ctx.preset]
     if not merged.abr:
         encode_cmd += ["-crf", str(ctx.crf)]
     encode_cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    if timestamped:
+        encode_cmd += ["-fps_mode", "passthrough", "-enc_time_base", "demux",
+                       "-avoid_negative_ts", "disabled"]
     encode_cmd += merged.out_extra
     encode_cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error",
                    str(dst)]
@@ -2617,6 +2696,7 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
         def drain_decoder(pipe):
             for line in iter(pipe.readline, b""):
                 decoder_errors.append(line.decode("utf-8", "replace").rstrip())
+                del decoder_errors[:-40]
 
         try:
             decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE,
@@ -2628,8 +2708,14 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
                 target=drain_decoder, args=(decode_err,), daemon=True)
             error_thread.start()
             index = 0
+            if timestamped:
+                from frame_pipeline import process_packets
+                from timestamped_frames import read_packets, write_packets
+                packets = read_packets(decode_out, {"clip": clip, "fps": fps}, stop_event)
+                index = write_packets(process_packets(packets, processors), encoder_input,
+                                      (height, width, 3), fps, stop_event)
             frame_bytes = width * height * 3
-            while not stop_event.is_set():
+            while not timestamped and not stop_event.is_set():
                 raw = read_frame(decode_out, frame_bytes)
                 if stop_event.is_set():
                     break
@@ -2679,6 +2765,8 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
                 detail += "\n" + "\n".join(decoder_errors)
             raise RuntimeError(detail) from exc
         finally:
+            for processor in processors:
+                processor.reset()
             if decoder is not None:
                 for pipe in (decoder.stdin, decoder.stdout, decoder.stderr):
                     if pipe is not None and not pipe.closed:

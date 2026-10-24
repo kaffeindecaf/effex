@@ -4,10 +4,10 @@ purpose: pick one item per session, finish it end-to-end (code + test + docs),
 then check it off with a done note saying what actually landed.
 format: `[ ]` open, `[x]` done, done notes indented under the item.
 state: input/ holds source videos, output/ holds renders and previews, effex.py
-is the tool (v0.12.0, 23 effects, chains of two or more), tests/ has nine
+is the tool (v0.12.0, 24 effects, chains of two or more), tests/ has ten
 suites. verify before closing an item with:
 
-    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install + stateful + psychedelic + collapse + seams
+    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install + stateful + psychedelic + collapse + seams + inversion
     python3 tests/make_clip.py        # drop a lavfi test clip into input/
     ./install.sh                      # effex onto ~/.local/bin
 
@@ -350,7 +350,7 @@ decision.
 
 ### stateful glitch effects
 
-Six effects from the requested design prompt. Temporal Sediment and Elastic Collapse are implemented; the remaining four are checklist items, not implementations.
+Six effects from the requested design prompt. Temporal Sediment, Elastic Collapse and Causality Inversion are implemented; the remaining three are checklist items, not implementations.
 
 Shared rules for the stateful effects:
 - Trace how `effex.py` scans/probes clips, builds `Plan`s, invokes custom runners, and encodes output. The core stays FFmpeg-filter based; Temporal Sediment adds a narrow per-frame adapter for stateful effects.
@@ -404,11 +404,23 @@ Shared rules for the stateful effects:
   - Reuse a shared flow field if the pipeline can safely provide one; otherwise estimate dense flow from previous/current grayscale frames at a configurable analysis resolution, starting with Farneback flow if OpenCV is accepted. Smooth and clamp vectors, apply a tunable gain, and remap the current frame. Verify the displacement sign with a synthetic moving shape before tuning the look.
   - Options: flow gain, nonlinear gain, motion threshold, analysis resolution, smoothing, max displacement, optional trail amount/decay, seed for randomized modulation.
   - Handle the first frame without history. Test direction/sign, stronger displacement at higher gain, relative stability on static footage, valid shape/dtype, and CPU cost.
-- [ ] E2.49 - causality inversion (prompt effect 20): let selected regions borrow pixels from later video frames.
+- [x] E2.49 - causality inversion (prompt effect 20): let selected regions borrow pixels from later video frames.
   - Use a bounded look-ahead buffer of frames and timestamps. Start with future-frame blend and replacement; add region tearing or motion alignment as separate modes. Preserve output timestamps and dimensions.
   - Document the look-ahead delay. Live input cannot provide genuine future frames without buffering or prediction. Near clip end, reduce the blend or use the latest available frame.
   - Options: look-ahead seconds, blend/replacement strength, offset, region/mask mode, mask speed, motion alignment, edge feather, seed.
   - Test that a moving synthetic object appears early by the configured offset, blend and replacement differ, unavailable future frames take the documented fallback, and memory/timestamps remain bounded and valid.
+  _Done: `inversion` adds bounded look-ahead with separate blend, replacement,
+  band-tearing and CPU-flow-aligned modes. Region masks, speed, feathering,
+  strength, horizon/offset, alignment and seed are configurable. Queues cap at
+  128 frames/128 MiB, reject impossible nominal settings and clamp dense VFR
+  bursts/EOF/cuts to available future content. Streaming stages retain rational
+  PTS and dimensions through optional PyAV/NUT transport inside the existing
+  FFmpeg render lifecycle; compatible unfiltered audio is copied. Tests verify
+  early moving objects, distinct modes, ownership, resets/cuts, budget bounds,
+  EOF, exact VFR/nonzero-start PTS, audio packet timing, stage ordering, short
+  writes, failure/cancel cleanup and the menu. Separate 360p/720p benchmarks for
+  all four modes are saved in benchmarks/inversion.json. README documents
+  buffering latency, live-input limits, fallback and optional dependencies._
 
 ---
 

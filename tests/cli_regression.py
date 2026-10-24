@@ -376,6 +376,8 @@ def main() -> int:
                env_extra=env)
     c.check("dropout dry-run carries the random select",
             "select='gt(random(0),0.3)'" in proc.stdout.decode())
+    c.check("dropout prevents CFR from recreating removed frames",
+            "-fps_mode vfr" in proc.stdout.decode())
     proc = run([EFFEX, "dropout", clip, "--set", "chance=30", "--json"],
                env_extra=env)
     dropped = Path(json.loads(proc.stdout.decode())["output"])

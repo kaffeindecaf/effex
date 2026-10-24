@@ -26,6 +26,7 @@ SUITES = {
     "psychedelic": HERE / "psychedelic_regression.py",
     "collapse": HERE / "collapse_regression.py",
     "seams": HERE / "seam_carving_regression.py",
+    "inversion": HERE / "inversion_regression.py",
 }
 
 

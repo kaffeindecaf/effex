@@ -1,0 +1,3 @@
+-r requirements-stateful.txt
+# Timestamped NUT transport; aligned mode additionally needs requirements-collapse.txt.
+av>=14

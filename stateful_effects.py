@@ -1,5 +1,7 @@
 """Bounded, stateful frame processors used by effex's raw-frame runner."""
 import math
+from collections import deque
+from dataclasses import replace
 from typing import Any, Optional
 
 
@@ -485,3 +487,211 @@ class ElasticCollapse:
         map_y += np.arange(height, dtype=np.float32)[:, None]
         return cv.remap(frame, map_x, map_y, interpolation=cv.INTER_LINEAR,
                         borderMode=cv.BORDER_REFLECT_101)
+
+
+class CausalityInversion:
+    """Bounded future-pixel borrowing; emit each packet on its original timeline."""
+
+    requires_timestamps = True
+    MAX_STATE_BYTES: int = 128 * 1024 * 1024
+    MAX_FRAMES = 128
+    DEFAULTS = {
+        "lookahead": 0.5, "offset": 0.5, "strength": 65, "mode": "blend",
+        "region": "full", "mask_speed": 0.25, "alignment": 100,
+        "feather": 10, "seed": 0,
+    }
+
+    def __init__(self):
+        self._np: Any = None
+        self._config = {}
+        self._shape = (0, 0, 0)
+        self._queue = deque()
+        self._seed = 0
+        self._capacity = 0
+        self._next_index = None
+        self._last_timestamp = None
+        self._scene_sample: Any = None
+        self._coverage: Any = None
+        self.capacity_fallbacks = 0
+
+    def initialize(self, config: dict, frame_shape: tuple, fps: float, seed: int) -> None:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise RuntimeError("Causality Inversion needs requirements-inversion.txt") from exc
+        if (len(frame_shape) != 3 or frame_shape[2] != 3
+                or any(int(v) < 1 for v in frame_shape)):
+            raise ValueError("Causality Inversion expects an HxWx3 RGB frame")
+        self._np = np
+        self._shape = tuple(int(v) for v in frame_shape)
+        self._config = dict(self.DEFAULTS)
+        for key, default in self.DEFAULTS.items():
+            if key in ("mode", "region"):
+                value = str(config.get(key, default))
+                choices = (("blend", "replace", "tear", "align") if key == "mode"
+                           else ("full", "bands", "blocks", "patch"))
+                if value not in choices:
+                    raise ValueError(f"invalid inversion {key}: {value}")
+                self._config[key] = value
+            else:
+                high = (5 if key in ("lookahead", "offset") else
+                        4 if key == "mask_speed" else
+                        2147483647 if key == "seed" else 100)
+                value = ElasticCollapse._number(config.get(key, default), default, 0, high)
+                self._config[key] = (value if key in ("lookahead", "offset", "mask_speed")
+                                     else int(value))
+        if self._config["offset"] > self._config["lookahead"]:
+            raise ValueError("inversion offset must not exceed lookahead seconds")
+        if self._config["mode"] == "align" and self._config["alignment"]:
+            try:
+                import cv2  # noqa: F401
+            except ImportError as exc:
+                raise RuntimeError("Aligned inversion needs requirements-collapse.txt") from exc
+        self._seed = int(ElasticCollapse._number(seed, 0, 0, 2147483647))
+        frame_bytes = math.prod(self._shape)
+        self._capacity = min(self.MAX_FRAMES, (self.MAX_STATE_BYTES - 65536) // frame_bytes)
+        delay = self._config["lookahead"] if self._config["strength"] and self._config["offset"] else 0
+        rate = ElasticCollapse._number(fps, 30.0, 0.001, 1000)
+        needed = math.ceil(delay * rate) + 1
+        if needed > self._capacity:
+            raise ValueError(
+                f"inversion lookahead needs {needed} frames but the 128 MiB/128-frame "
+                f"budget fits {self._capacity}; lower lookahead or resize before inversion"
+            )
+        self.reset()
+
+    @property
+    def state_nbytes(self) -> int:
+        total = sum(packet.frame.nbytes for packet in self._queue)
+        return int(total + sum(a.nbytes for a in (self._scene_sample, self._coverage)
+                               if a is not None))
+
+    @property
+    def buffered_frames(self) -> int:
+        return len(self._queue)
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def serialize_config(self) -> dict:
+        return dict(self._config)
+
+    def reset(self) -> None:
+        self._queue.clear()
+        self._next_index = None
+        self._last_timestamp = None
+        self._scene_sample = None
+        self._coverage = None
+        self.capacity_fallbacks = 0
+
+    def _mask(self, timestamp):
+        np = self._np
+        height, width = self._shape[:2]
+        y = np.arange(height, dtype=np.float32)[:, None] / max(1, height - 1)
+        x = np.arange(width, dtype=np.float32)[None, :] / max(1, width - 1)
+        phase = (self._seed % 997) / 997 * 2 * math.pi
+        t = float(timestamp) * self._config["mask_speed"] * 2 * math.pi
+        region = self._config["region"]
+        if region == "full":
+            return np.ones((height, width), np.float32)
+        if region == "bands":
+            signed = np.broadcast_to(np.sin(y * 8 * math.pi + t + phase), (height, width))
+        elif region == "blocks":
+            signed = np.sin(x * 8 * math.pi + t + phase) * np.sin(y * 6 * math.pi - t)
+        else:
+            cx, cy = 0.5 + 0.23 * math.sin(t + phase), 0.5 + 0.23 * math.cos(t + phase)
+            signed = 0.25 - np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+        feather = self._config["feather"] / 100.0
+        return (np.clip(0.5 + signed / (2 * feather), 0, 1).astype(np.float32)
+                if feather else (signed >= 0).astype(np.float32))
+
+    def _borrow(self, current, future):
+        np = self._np
+        mode = self._config["mode"]
+        height, width = self._shape[:2]
+        if mode == "tear":
+            rows = np.arange(height)[:, None]
+            phase = float(current.timestamp) * self._config["mask_speed"] * 2 * math.pi
+            offsets = np.rint(np.sin(rows // max(1, height // 8) + phase
+                                     + self._seed) * max(1, width // 8)).astype(np.int32)
+            return future.frame[rows, (np.arange(width)[None, :] + offsets) % width]
+        if mode != "align" or not self._config["alignment"] or min(height, width) < 8:
+            return future.frame
+        import cv2 as cv
+        scale = min(1.0, 192 / max(height, width))
+        size = (max(8, round(width * scale)), max(8, round(height * scale)))
+        a = cv.cvtColor(cv.resize(current.frame, size), cv.COLOR_RGB2GRAY)
+        b = cv.cvtColor(cv.resize(future.frame, size), cv.COLOR_RGB2GRAY)
+        flow = cv.calcOpticalFlowFarneback(a, b, None, 0.5, 3, 21, 5, 7, 1.5, 0)
+        flow = cv.resize(flow, (width, height))
+        gain = self._config["alignment"] / 100.0
+        mx = np.arange(width, dtype=np.float32)[None, :] + np.clip(flow[:, :, 0] * width / size[0], -width / 4, width / 4) * gain
+        my = np.arange(height, dtype=np.float32)[:, None] + np.clip(flow[:, :, 1] * height / size[1], -height / 4, height / 4) * gain
+        return cv.remap(future.frame, mx, my, cv.INTER_LINEAR, borderMode=cv.BORDER_REFLECT_101)
+
+    def _mix(self, current, future):
+        np = self._np
+        strength = self._config["strength"] / 100.0
+        if strength == 0 or current.timestamp == future.timestamp:
+            return replace(current, frame=current.frame.copy())
+        borrowed = self._borrow(current, future)
+        mask = self._mask(current.timestamp)
+        if self._config["mode"] == "replace":
+            if self._coverage is None:
+                self._coverage = np.random.default_rng(self._seed).random((16, 16)).astype(np.float32)
+            height, width = self._shape[:2]
+            rows = np.arange(height) * 16 // height
+            cols = np.arange(width) * 16 // width
+            alpha = (self._coverage[rows[:, None], cols[None, :]] < strength).astype(np.float32)
+            alpha = (alpha * mask)[:, :, None]
+        else:
+            alpha = (strength * mask)[:, :, None]
+        result = current.frame.astype(np.float32) * (1 - alpha) + borrowed.astype(np.float32) * alpha
+        return replace(current, frame=np.ascontiguousarray(np.clip(result, 0, 255).round().astype(np.uint8)))
+
+    def _emit_oldest(self):
+        current = self._queue.popleft()
+        target = float(current.timestamp) + self._config["offset"]
+        future = next((p for p in self._queue if float(p.timestamp) + 1e-9 >= target),
+                      self._queue[-1] if self._queue else current)
+        return self._mix(current, future)
+
+    def push(self, packet):
+        if self._np is None:
+            raise RuntimeError("initialize Causality Inversion before buffering")
+        np = self._np
+        if (not isinstance(packet.frame, np.ndarray) or packet.frame.shape != self._shape
+                or packet.frame.dtype != np.uint8):
+            raise ValueError(f"expected uint8 RGB frame {self._shape}")
+        stamp = float(packet.timestamp)
+        if not math.isfinite(stamp):
+            raise ValueError("inversion needs finite presentation timestamps")
+        if ((self._next_index is not None and packet.index != self._next_index)
+                or (self._last_timestamp is not None and stamp < self._last_timestamp)):
+            self.reset()
+        sample = packet.frame[::max(1, self._shape[0] // 32),
+                              ::max(1, self._shape[1] // 32)].copy()
+        cut = (self._scene_sample is not None and
+               float(np.abs(sample.astype(np.float32) - self._scene_sample.astype(np.float32)).mean()) >= 140.25)
+        if cut or packet.context.get("scene_cut"):
+            yield from self.flush()
+        self._scene_sample = sample
+        self._next_index = packet.index + 1
+        self._last_timestamp = stamp
+        if self._config["strength"] == 0 or self._config["offset"] == 0:
+            yield replace(packet, frame=packet.frame.copy())
+            return
+        while len(self._queue) >= self._capacity:
+            self.capacity_fallbacks += 1
+            yield self._emit_oldest()
+        self._queue.append(replace(packet, frame=packet.frame.copy()))
+        while self._queue and stamp - float(self._queue[0].timestamp) + 1e-9 >= self._config["lookahead"]:
+            yield self._emit_oldest()
+
+    def flush(self):
+        """EOF/cut: clamp unavailable future requests to the last buffered frame."""
+        while self._queue:
+            yield self._emit_oldest()
+        self._scene_sample = None
+        self._coverage = None
