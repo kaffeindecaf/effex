@@ -486,7 +486,8 @@ def scenario_newkinds(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"8")                                   # rgbsplit
+    next_effect_group(d)                           # color & texture
+    d.send(ENTER)                                  # rgbsplit
     d.wait_for("rgbsplit options")
     d.send(DOWN)
     d.send(DOWN)                                   # channels row
@@ -527,7 +528,9 @@ def scenario_newkinds(c: Checker):
     d.pump(0.5)                                    # main menu -> video picker
     d.send(ENTER)
     d.pump(0.5)                                    # video picker -> effect picker
-    d.send(b"9")                                   # deepfry
+    next_effect_group(d)                           # color & texture
+    d.send(DOWN)
+    d.send(ENTER)                                  # deepfry
     c.check("deepfry options open", d.wait_for("deepfry options"))
     d.send(ENTER)
     c.check("percent prompt names the range",
@@ -558,7 +561,8 @@ def scenario_vhs(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 11)                              # vhs, effect 12
+    next_effect_group(d)
+    d.send(DOWN * 4)                               # vhs
     d.send(ENTER)
     c.check("vhs options open", d.wait_for("vhs options"))
     c.check("vhs rows are shown", "chroma bleed" in d.text()
@@ -586,7 +590,8 @@ def scenario_channelswap(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 10)                              # channelswap, effect 11
+    next_effect_group(d)
+    d.send(DOWN * 3)                               # channelswap
     d.send(ENTER)
     c.check("channelswap options open", d.wait_for("channelswap options"))
     c.check("channelswap rows are shown",
@@ -614,7 +619,8 @@ def scenario_timescratch(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 14)                              # timescratch, effect 15
+    next_effect_group(d, 2)                         # time & memory group
+    d.send(DOWN)                                   # timescratch
     d.send(ENTER)
     c.check("timescratch options open", d.wait_for("timescratch options"))
     c.check("timescratch rows are shown", "curve" in d.text()
@@ -644,7 +650,8 @@ def scenario_temporal_sediment(c: Checker):
     d.wait_for("pick a video")
     d.send(ENTER)
     d.wait_for("pick an effect")
-    d.send(b"j" * 15)                              # temporal sediment, effect 16
+    next_effect_group(d, 2)                         # time & memory group
+    d.send(DOWN * 2)                               # temporal sediment
     d.send(ENTER)
     c.check("temporal sediment options open",
             d.wait_for("temporal sediment options"))
@@ -776,6 +783,97 @@ def scenario_chain(c: Checker):
     d.close()
 
 
+def scenario_psychedelic(c: Checker):
+    """both new color effects can be tuned, previewed and rendered"""
+    from harness import newest_mp4
+
+    for offset, name, label, tuned in (
+            (6, "channel lobotomy", "red levels", "16 levels"),
+            (7, "neon hue cycle", "hue swing", "130")):
+        in_dir, out_dir = temp_folders()
+        make_clip(in_dir / "clip.mp4", seconds=1, size="160x90")
+        d = start(env_for(in_dir, out_dir))
+        try:
+            d.wait_for("main menu")
+            d.send(b"p")
+            d.wait_for("pick a video")
+            d.send(ENTER)
+            d.wait_for("pick an effect")
+            next_effect_group(d)
+            d.send(DOWN * offset)
+            d.send(ENTER)
+            c.check(f"{name} options open", wait_last(d, f"{name} options"))
+            c.check(f"{name} exposes its controls", label in last_frame(d))
+            press_and_wait(d, RIGHT)
+            c.check(f"{name} can be tuned", tuned in last_frame(d))
+            d.send(b"p")
+            c.check(f"{name} preview succeeds",
+                    wait_last(d, "preview wrote", timeout=30))
+            d.send(b"r")
+            c.check(f"{name} reaches confirmation",
+                    wait_last(d, "render this video?"))
+            d.send(ENTER)
+            c.check(f"{name} render succeeds", wait_last(d, "wrote", timeout=30))
+            out = newest_mp4(out_dir)
+            c.check(f"{name} preserves dimensions and audio",
+                    out is not None and "PREVIEW" not in out.name
+                    and video_dims(out) == (160, 90) and audio_codec(out) == "aac")
+            d.send(ENTER)
+            wait_last(d, "main menu")
+            d.send(b"q")
+            c.check(f"{name} exits cleanly", d.expect_exit(6) == 0)
+        finally:
+            d.close()
+
+
+def scenario_collapse(c: Checker):
+    """elastic and offline seam modes share controls and the normal renderer"""
+    import importlib.util
+    from harness import newest_mp4
+
+    if importlib.util.find_spec("cv2") is None or importlib.util.find_spec("numpy") is None:
+        print("  SKIP collapse menu tests need requirements-collapse.txt")
+        return
+    for mode in ("elastic", "seam"):
+        in_dir, out_dir = temp_folders()
+        make_clip(in_dir / "clip.mp4", seconds=1, size="160x90")
+        d = start(env_for(in_dir, out_dir))
+        try:
+            d.wait_for("main menu")
+            d.send(b"p")
+            d.wait_for("pick a video")
+            d.send(ENTER)
+            d.wait_for("pick an effect")
+            d.send(b"8")                           # collapse, last shape effect
+            c.check(f"collapse {mode}: options open", wait_last(d, "collapse options"))
+            c.check(f"collapse {mode}: controls present", all(
+                label in last_frame(d) for label in
+                ("horizontal deformation amount", "vertical deformation amount",
+                 "protect strong edges", "seam strength",
+                 "smooth field changes", "random seed")))
+            press_and_wait(d, RIGHT)
+            c.check(f"collapse {mode}: intensity is editable", "70%" in last_frame(d))
+            if mode == "seam":
+                for _ in range(4):
+                    press_and_wait(d, DOWN)
+                press_and_wait(d, RIGHT)
+                c.check("collapse seam: offline mode can be selected", "seam (offline)" in last_frame(d))
+            c.check(f"collapse {mode}: no unsupported preview key", "p preview" not in last_frame(d))
+            d.send(b"r")
+            c.check(f"collapse {mode}: confirm opens", wait_last(d, "render this video?"))
+            d.send(ENTER)
+            c.check(f"collapse {mode}: render finishes", wait_last(d, "wrote", timeout=30))
+            out = newest_mp4(out_dir)
+            c.check(f"collapse {mode}: size and AAC preserved",
+                    out is not None and video_dims(out) == (160, 90) and audio_codec(out) == "aac")
+            d.send(ENTER)
+            wait_last(d, "main menu")
+            d.send(b"q")
+            c.check(f"collapse {mode}: exits cleanly", d.expect_exit(6) == 0)
+        finally:
+            d.close()
+
+
 def main() -> int:
     c = Checker("menu smoke")
     if not require_tools(c):
@@ -786,7 +884,8 @@ def main() -> int:
                      scenario_datamosh_second, scenario_newkinds,
                      scenario_vhs, scenario_channelswap,
                      scenario_timescratch, scenario_temporal_sediment,
-                     scenario_chain, scenario_backout):
+                     scenario_chain, scenario_psychedelic, scenario_collapse,
+                     scenario_backout):
         print(f"  -- {scenario.__name__}")
         scenario(c)
     return c.summary()
