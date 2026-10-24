@@ -25,8 +25,8 @@ from pty_driver import PtyDriver  # noqa: E402
 SGR = re.compile(r"\033\[[0-9;]*m")
 ENTER = b"\r"
 
-# sizes to check: a phone-ish pty, the classic 80x24, and something wide
-SIZES = [(60, 20), (80, 24), (120, 40)]
+# sizes to check: narrow/wide scaling, the classic 80x24, and something wide
+SIZES = [(36, 20), (60, 20), (80, 24), (120, 40), (160, 40)]
 
 
 def vis(line: str) -> int:
@@ -71,7 +71,8 @@ def scenario_fit(c: Checker, cols: int, rows: int) -> PtyDriver:
     in_dir, out_dir = temp_folders()
     make_clip(in_dir / "a_long_video_name_for_testing_columns.mp4", seconds=1)
     make_clip(in_dir / "b.mp4", seconds=1)
-    env = env_for(in_dir, out_dir)
+    # Stale shell dimensions must not override a resized TTY.
+    env = {**env_for(in_dir, out_dir), "COLUMNS": "84", "LINES": "24"}
 
     d = PtyDriver([sys.executable, str(EFFEX)], rows=rows, cols=cols,
                   env_extra=env, timeout=10)
@@ -92,12 +93,15 @@ def check_frame(c: Checker, label: str, frame: str, cols: int) -> None:
             plain_of(frame).count("\u2500" * 10) >= 2)
 
 
-def check_rows_aligned(c: Checker, label: str, frame: str) -> None:
+def check_rows_aligned(c: Checker, label: str, frame: str,
+                       expected_width: int) -> None:
     """list rows are padded to one width, so their columns line up"""
     rows = body_of(frame)
     widths = {vis(line) for line in rows}
     c.check(f"{label}: rows share one width", len(widths) == 1,
             f"{len(rows)} rows, widths seen: {sorted(widths)}")
+    c.check(f"{label}: rows fill the available width", widths == {expected_width},
+            f"expected {expected_width}, got {sorted(widths)}")
 
 
 def scenario_sizes(c: Checker) -> None:
@@ -109,13 +113,13 @@ def scenario_sizes(c: Checker) -> None:
 
         menu = frame_with(stream, "main menu")
         check_frame(c, f"{cols}x{rows} main menu", menu, cols)
-        check_rows_aligned(c, f"{cols}x{rows} main menu", menu)
+        check_rows_aligned(c, f"{cols}x{rows} main menu", menu, cols - 2)
 
         d.send(b"p")
         d.wait_for("pick a video")
         picker = frame_with(d.text(), "pick a video")
         check_frame(c, f"{cols}x{rows} video list", picker, cols)
-        check_rows_aligned(c, f"{cols}x{rows} video list", picker)
+        check_rows_aligned(c, f"{cols}x{rows} video list", picker, cols - 2)
         c.check(f"{cols}x{rows}: long file names are cut, not wrapped",
                 "a_long_video_name_for_testing_columns.mp4" in
                 SGR.sub("", picker)
