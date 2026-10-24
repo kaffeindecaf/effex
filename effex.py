@@ -1666,6 +1666,8 @@ def build_dropout(ctx: EffectContext) -> Plan:
     return Plan(
         vf=f"select='gt(random(0),{chance / 100:g})'",
         out_suffix="_DROPOUT",
+        # FFmpeg 6 defaults to CFR here and recreates frames that select removed.
+        out_extra=["-fps_mode", "vfr"],
         width=w,
         height=h,
         notes=[
