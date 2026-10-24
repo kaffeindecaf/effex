@@ -3100,12 +3100,22 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
 # terminal: geometry, key input
 # ---------------------------------------------------------------------------
 
+def terminal_size() -> os.terminal_size:
+    """Use the live TTY size so stale COLUMNS/LINES env vars cannot clip frames."""
+    if sys.stdout.isatty():
+        try:
+            return os.get_terminal_size(sys.stdout.fileno())
+        except OSError:
+            pass
+    return shutil.get_terminal_size((84, 24))
+
+
 def term_cols() -> int:
-    return max(48, min(shutil.get_terminal_size((84, 24)).columns, 140))
+    return max(1, terminal_size().columns)
 
 
 def term_rows() -> int:
-    return max(12, shutil.get_terminal_size((84, 24)).lines)
+    return max(1, terminal_size().lines)
 
 
 def _read_key(fd: int) -> str:
