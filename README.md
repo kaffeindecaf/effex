@@ -110,38 +110,40 @@ previews, and chain in either order without extra dependencies.
 
 ## content-aware elastic collapse
 
-`collapse` lives under **SHAPE & MOTION**. The default `elastic` mode evolves
-seeded, spatially nonuniform displacement fields. Gradient-rich regions resist
-deformation; motion can amplify it elsewhere. Fields are analyzed at no more
-than 192 pixels on the longest side, smoothed in time, then resized into
-full-frame maps for CPU `cv2.remap`. This is not a uniform zoom. Reflective
-sampling keeps edges filled and output dimensions never change.
+`collapse` lives under **SHAPE & MOTION**. The default `seam` mode behaves like
+Photoshop content-aware scaling: each frame starts at its original composition,
+then its content-aware shrink grows linearly from the first frame to the clip's
+end. Low-energy seams are removed from a reduced analysis frame, and the carved
+coordinate map is stretched back over the original canvas, so output dimensions
+never change. High-gradient regions resist shrinking. Analysis is capped at 192
+pixels on the longest side and updates at most five times per second; the
+displacement field is smoothed between updates. `mode=elastic` keeps the earlier
+seeded, spatially nonuniform elastic warp available as an alternative.
 
 | option | range / values | default |
 | --- | --- | --- |
-| `intensity` | 0-100%, displacement strength | 65% |
-| `horizontal` | 0-100%, horizontal deformation scale | 65% |
-| `vertical` | 0-100%, vertical deformation scale | 45% |
+| `intensity` | 0-100%, overall scale strength (elastic warp strength in elastic mode) | 65% |
+| `horizontal` | 0-100%, share of the maximum width shrink / horizontal warp | 65% |
+| `vertical` | 0-100%, share of the maximum height shrink / vertical warp | 45% |
 | `preserve` | 0-100%, content/edge protection | 75% |
-| `mode` | elastic, seam | elastic |
-| `seam_strength` | 0-100%, offline seam removal amount | 60% |
+| `mode` | seam, elastic | seam |
+| `seam_strength` | 0-100%, maximum content-aware shrink by clip end | 60% |
 | `motion` | 0-100%, elastic motion influence | 50% |
 | `smoothness` | 0-100%, spatial field smoothness | 70% |
 | `speed` | 0-4 elastic cycles per second | 0.35 |
 | `coherence` | 0-100%, elapsed-time field smoothing | 80% |
-| `seed` | 0-2147483647; 0 derives phases from the source | 0 |
+| `seed` | 0-2147483647; elastic mode only, 0 derives phases from the source | 0 |
 
-The optional `seam` mode is an offline content-aware carve, not a full-resolution
-seam search on every frame. A gradient-energy dynamic program removes at most
-four seams per axis from the reduced frame, at most once every 0.2 seconds of
-video. Source coordinate maps are carved alongside the image, resized to the
-original dimensions, and temporally smoothed before sampling the current frame.
-This smooths seam decisions rather than crossfading old pixels. Seam mode uses
-`seam_strength`, the two axis scales, preservation, smoothness, coherence and
-intensity. Elastic motion, speed and random phases do not drive seam selection.
+In seam mode, shrink is capped at 50% per axis. The target reduction is
+`50% × intensity × seam_strength × horizontal/vertical control`; `preserve`
+steers seams away from strong edges. The final displacement is multiplied by
+elapsed clip progress, producing a linear ramp while each output frame remains
+at source dimensions. `smoothness` and `coherence` steady the reduced-resolution
+seam map; motion, speed, and random phases apply only to elastic mode.
 
 Zero intensity is an exact passthrough; two zero axis scales disable both modes.
-Zero seam strength disables seam mode. The first frame is deformed immediately.
+Zero seam strength disables seam mode. Seam mode leaves the first frame
+unchanged and reaches its configured scale at the end of the clip.
 State resets on a new input/shape, explicit reset, rewind, frame discontinuity,
 explicit scene cut, or a large RGB scene change. Persistent analysis state is
 bounded independently of clip length; full-frame remap buffers are transient.

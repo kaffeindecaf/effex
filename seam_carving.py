@@ -10,9 +10,9 @@ dependency needed only for the map resize; the analytic seam finders work with
 numpy alone.
 """
 import math
-from typing import List
+from typing import List, Optional
 
-_MAX_SEAMS = 4
+_MAX_SEAMS = 96
 
 
 def _coerce_scalar(value: float) -> float:
@@ -26,8 +26,10 @@ def _coerce_scalar(value: float) -> float:
     return min(1.0, max(0.0, number))
 
 
-def _coerce_seams(value) -> int:
-    """Clamp max_seams to an integer in [0, 4]."""
+def _coerce_seams(value) -> Optional[int]:
+    """Clamp max_seams to [0, 96], or keep None as an uncapped request."""
+    if value is None:
+        return None
     try:
         number = int(value)
     except (TypeError, ValueError, OverflowError):
@@ -126,17 +128,17 @@ def _remove_horizontal_seam(array, seam: List[int]):
 
 
 def build_seam_field(frame, horizontal, vertical, strength, preservation,
-                     max_seams: int = 4):
+                     max_seams: Optional[int] = 4, max_shrink: float = 1.0):
     """Return a normalized HxWx2 displacement field from seam carving.
 
     ``frame`` is a reduced-resolution uint8 RGB array (H, W, 3).  The scalar
     controls are clamped to [0, 1] (non-finite becomes 0).  ``max_seams`` is
-    clamped to [0, 4].  Up to ``strength * horizontal * max_seams`` vertical
-    seams (one pixel per row) are removed, producing x displacement, and up to
-    ``strength * vertical * max_seams`` horizontal seams (one pixel per
-    column) are removed, producing y displacement.  Each seam is the min-cost
-    path through the preservation-weighted gradient energy, found by dynamic
-    programming.
+    ``max_seams`` caps removals at [0, 96]; None derives the count from the
+    axis length and ``max_shrink``. ``max_shrink`` is clamped to [0, 1]. With
+    an explicit cap, up to ``strength * horizontal * max_seams`` vertical
+    seams and ``strength * vertical * max_seams`` horizontal seams are removed,
+    subject to each axis's ``max_shrink`` limit. Each seam is the min-cost path
+    through preservation-weighted gradient energy, found by dynamic programming.
 
     Source coordinate maps are carved alongside the energy, then resized back
     to the original HxW via cv2.resize.  The returned field is the carved
@@ -152,6 +154,7 @@ def build_seam_field(frame, horizontal, vertical, strength, preservation,
     strength = _coerce_scalar(strength)
     preservation = _coerce_scalar(preservation)
     max_seams = _coerce_seams(max_seams)
+    max_shrink = _coerce_scalar(max_shrink)
 
     frame = np.asarray(frame)
     if frame.ndim != 3 or frame.shape[2] != 3:
@@ -165,10 +168,16 @@ def build_seam_field(frame, horizontal, vertical, strength, preservation,
             or (horizontal == 0.0 and vertical == 0.0)):
         return zero
 
-    n_vertical = min(int(round(strength * horizontal * max_seams)),
-                     width - 1)
-    n_horizontal = min(int(round(strength * vertical * max_seams)),
-                       height - 1)
+    vertical_limit = min(width - 1, int(round((width - 1) * max_shrink)))
+    horizontal_limit = min(height - 1, int(round((height - 1) * max_shrink)))
+    if max_seams is None:
+        n_vertical = int(round(strength * horizontal * vertical_limit))
+        n_horizontal = int(round(strength * vertical * horizontal_limit))
+    else:
+        n_vertical = int(round(strength * horizontal * max_seams))
+        n_horizontal = int(round(strength * vertical * max_seams))
+    n_vertical = min(n_vertical, vertical_limit)
+    n_horizontal = min(n_horizontal, horizontal_limit)
     if n_vertical == 0 and n_horizontal == 0:
         return zero
 

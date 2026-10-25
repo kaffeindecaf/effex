@@ -283,17 +283,18 @@ class TemporalSediment:
 
 
 class ElasticCollapse:
-    """Content-weighted CPU displacement with bounded low-resolution state.
+    """Progressive content-aware scaling or elastic warp with bounded state.
 
-    OpenCV is loaded only on initialization. Full-size maps are transient;
-    evolving fields and scene/motion analysis never exceed MAX_WORK_SIDE.
+    Seam mode linearly scales a reduced-resolution carved field over clip time;
+    elastic mode evolves a seeded nonuniform field. OpenCV is loaded only on
+    initialization; full-size maps are transient and analysis stays bounded.
     """
 
     MAX_WORK_SIDE = 192
     MAX_STATE_BYTES = 4 * 1024 * 1024
     DEFAULTS = {
         "intensity": 65, "horizontal": 65, "vertical": 45, "preserve": 75,
-        "mode": "elastic", "seam_strength": 60, "motion": 50,
+        "mode": "seam", "seam_strength": 60, "motion": 50,
         "smoothness": 70, "speed": 0.35, "coherence": 80, "seed": 0,
     }
 
@@ -304,6 +305,8 @@ class ElasticCollapse:
         self._shape = (0, 0, 0)
         self._work_shape = (0, 0)
         self._fps = 30.0
+        self._clip_duration: Optional[float] = None
+        self._progress = 1.0
         self._seed = 0
         self._x: Any = None
         self._y: Any = None
@@ -352,6 +355,8 @@ class ElasticCollapse:
                 number = self._number(config.get(key, default), default, 0, high)
                 self._config[key] = number if key == "speed" else int(number)
         self._fps = self._number(fps, 30.0, 0.001, 1000)
+        duration = self._number(config.get("_clip_duration"), None, 0, 1e12)
+        self._clip_duration = duration if duration and duration > 0 else None
         self._seed = int(self._number(seed, 0, 0, 2147483647))
         height, width = self._shape[:2]
         scale = min(1.0, self.MAX_WORK_SIDE / max(height, width))
@@ -378,7 +383,9 @@ class ElasticCollapse:
         """A copy of the applied normalized (dx, dy) field for diagnostics."""
         if self._field is None:
             return None
-        return self._field * (self._config["intensity"] / 100.0)
+        amount = (self._progress if self._config["mode"] == "seam"
+                  else self._config["intensity"] / 100.0)
+        return self._field * amount
 
     def serialize_config(self) -> dict:
         return dict(self._config)
@@ -392,6 +399,7 @@ class ElasticCollapse:
         self._previous_timestamp = None
         self._next_index = None
         self._clock = 0.0
+        self._progress = 1.0
         self._seam_target = None
         self._next_seam_time = 0.0
         self.seam_updates = 0
@@ -399,13 +407,15 @@ class ElasticCollapse:
     def _seam_field(self, current):
         from seam_carving import build_seam_field
 
-        # Never perform catch-up carving after a gap: one bounded update only.
+        # Update the target at most 5Hz; frame rendering scales it by clip progress.
         if self._seam_target is None or self._clock + 1e-9 >= self._next_seam_time:
             target = build_seam_field(
                 current, self._config["horizontal"] / 100.0,
                 self._config["vertical"] / 100.0,
-                self._config["seam_strength"] / 100.0,
-                self._config["preserve"] / 100.0, max_seams=4,
+                (self._config["intensity"] * self._config["seam_strength"]
+                 / 10000.0),
+                self._config["preserve"] / 100.0,
+                max_seams=None, max_shrink=0.5,
             )
             self._seam_target = self._cv.GaussianBlur(
                 target, (0, 0), 0.5 + 3 * self._config["smoothness"] / 100.0)
@@ -461,6 +471,13 @@ class ElasticCollapse:
         if ((self._next_index is not None and index != self._next_index)
                 or rewind or cut or (context or {}).get("scene_cut")):
             self.reset()
+        if self._config["mode"] == "seam":
+            self._progress = (
+                min(1.0, max(0.0, stamp / self._clip_duration))
+                if stamp is not None and self._clip_duration else 1.0
+            )
+        else:
+            self._progress = 1.0
         dt = (max(0.0, stamp - self._previous_timestamp)
               if stamp is not None and self._previous_timestamp is not None
               else 1.0 / self._fps)
@@ -478,11 +495,16 @@ class ElasticCollapse:
         self._previous_timestamp = stamp
         self._next_index = index + 1
         intensity = self._config["intensity"] / 100.0
-        if intensity == 0 or not (self._config["horizontal"] or self._config["vertical"]):
+        if (intensity == 0
+                or (self._config["mode"] == "seam"
+                    and self._config["seam_strength"] == 0)
+                or not (self._config["horizontal"] or self._config["vertical"])):
             return frame.copy()
         full = cv.resize(self._field, (width, height), interpolation=cv.INTER_LINEAR)
-        map_x = full[:, :, 0] * (intensity * max(0, width - 1))
-        map_y = full[:, :, 1] * (intensity * max(0, height - 1))
+        amount = (self._progress if self._config["mode"] == "seam"
+                  else intensity)
+        map_x = full[:, :, 0] * (amount * max(0, width - 1))
+        map_y = full[:, :, 1] * (amount * max(0, height - 1))
         map_x += np.arange(width, dtype=np.float32)[None, :]
         map_y += np.arange(height, dtype=np.float32)[:, None]
         return cv.remap(frame, map_x, map_y, interpolation=cv.INTER_LINEAR,

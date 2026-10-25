@@ -373,28 +373,22 @@ Shared rules for the stateful effects:
   - On a motion event, queue a bounded frame or patch snapshot with a due timestamp. Release delayed frames or short repayment bursts without blocking the render loop. Handle clip end when queued debt remains.
   - Options: motion threshold/sensitivity, min/max delay, debt gain, release rate, burst size, freeze chance, patch mode, queue capacity, seed.
   - Test that static input creates little debt, a sudden moving shape triggers delayed output, sensitivity and release controls change behavior, fixed seeds repeat, and queue memory stays bounded.
-- [x] E2.46 - content-aware elastic collapse (prompt effect 05): deform the image nonuniformly while keeping the output dimensions fixed.
-  - Make real-time elastic remapping the default: evolve a smooth displacement/scale field, then sample with a CPU remap such as `cv2.remap` if OpenCV is justified. Do not reduce this to uniform zoom.
-  - Keep seam carving as an optional offline mode: use a gradient/energy map, work at reduced resolution, limit seams per update, smooth decisions over time, then resize to the required frame size. Do not carve every full-resolution frame without measuring flicker and cost.
-  - Options: intensity, horizontal/vertical scale, content preservation, seam strength/mode, motion influence, field smoothness/speed, temporal coherence, seed.
-  - Test fixed output size, stronger deformation at higher intensity, repeatability for a fixed seed, and less incidental flicker with temporal smoothing. Benchmark real-time and seam modes separately.
-  _Done: `collapse` defaults to seeded, smooth nonuniform elastic fields with
-  gradient-based content protection and motion weighting, sampled by CPU
-  `cv2.remap`. Offline `mode=seam` uses gradient-energy minimum-cost seams and
-  carved source-coordinate maps at <=192px, <=4 seams per axis, <=5 updates/s;
-  displacement decisions are smoothed over elapsed time. Exposes intensity,
-  axis scales, preservation, mode/strength, motion, smoothness/speed, coherence
-  and seed through the registry and menu. Reuses the stateful adapter, preserving
-  dimensions/audio and supporting sediment in either adjacent chain order.
-  Optional headless OpenCV is isolated in requirements-collapse.txt. Tests cover
-  deformation strength, content protection, repeatability, resets/cuts/rewinds,
-  tiny/short/static inputs, no mutation, passthrough, bounds, bounded state,
-  flicker reduction in both modes and real CLI/menu renders. All nine suites pass.
-  Separate 120-frame CPU benchmarks at 640x360 and 1280x720 are saved in
-  benchmarks/collapse.json, including frame time, update cost and peak process
-  RSS; README records the measured results without an end-to-end real-time claim.
-  Existing stateful VFR normalization, adjacent-processor and preview limits
-  remain explicit._
+- [x] E2.46 - content-aware scaling and elastic warp (prompt effect 05): change image composition while preserving output dimensions.
+  - Default to progressive content-aware scale: linearly ramp seam-carved shrink from identity at clip start to the configured target at clip end, then remap each frame to its original canvas.
+  - Analyze at reduced resolution, preserve high-energy regions, cap shrink to half per axis, and smooth cached decisions. Keep the earlier seeded elastic warp as an alternate mode.
+  - Options: intensity, horizontal/vertical shrink, content preservation, seam strength/mode, elastic motion influence, field smoothness/speed, temporal coherence, seed.
+  - Test linear progress against clip duration, fixed output size, content preservation, repeatability, bounded state and real CLI/menu renders.
+  _Done: `collapse` defaults to a content-aware seam scale that begins at the
+  source composition and grows linearly to its target over probed clip duration.
+  The low-resolution energy map removes seams from low-detail regions, then the
+  source-coordinate map is stretched back to the original frame dimensions.
+  Analysis is capped at 192px; shrink is limited to 50% per axis and refreshed
+  at <=5Hz with temporal smoothing. The seeded elastic warp remains selectable.
+  Duration flows through the shared stateful adapter. Tests cover exact start,
+  linear midpoint field, end-frame deformation, output shape/audio, resets,
+  preservation, optional dependencies and TUI/CLI integration. Optional headless
+  OpenCV remains isolated in requirements-collapse.txt. Existing stateful VFR
+  normalization, adjacent-processor and preview limits remain explicit._
 - [ ] E2.47 - pixel archaeology (prompt effect 09): transplant patches from earlier frames using content matching.
   - Keep a bounded reservoir of old frames or patches. Cache inexpensive descriptors such as color mean/variance, gradient histograms, or downsampled pixels; sample candidates instead of searching every patch in every frame.
   - Match current regions to historical patches by color, texture, or edge compatibility. Include a controlled mismatch mode. Support hard copy and soft/feathered boundaries; every replacement must come from actual video history, not random rectangles.

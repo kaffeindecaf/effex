@@ -1925,12 +1925,13 @@ COLLAPSE_PARAMS = (
           "percent", 45, minimum=0, maximum=100, step=5),
     Param("preserve", "content preservation", "protect strong edges from collapse",
           "percent", 75, minimum=0, maximum=100, step=5),
-    Param("mode", "mode", "fast elastic field or bounded offline seam carving",
-          "choice", "elastic", choices=(
-              ("elastic", "elastic", "smooth content-weighted CPU remapping"),
-              ("seam", "seam (offline)", "reduced-resolution energy-based seams"),
+    Param("mode", "mode", "progressive content-aware scaling or elastic warping",
+          "choice", "seam", choices=(
+              ("seam", "content-aware scale",
+               "linearly shrink by seams, then resize to the original frame"),
+              ("elastic", "elastic warp", "smooth content-weighted CPU remapping"),
           )),
-    Param("seam_strength", "seam strength", "seams removed per offline update",
+    Param("seam_strength", "shrink amount", "maximum content-aware shrink by the end of the clip",
           "percent", 60, minimum=0, maximum=100, step=5),
     Param("motion", "motion influence", "amplify elastic deformation in moving regions",
           "percent", 50, minimum=0, maximum=100, step=5),
@@ -1947,14 +1948,14 @@ COLLAPSE_PARAMS = (
 
 def build_collapse(ctx: EffectContext) -> Plan:
     width, height = _source_dims(ctx.clip, ctx.frame)
-    mode = str(ctx.opts.get("mode", "elastic"))
+    mode = str(ctx.opts.get("mode", "seam"))
     return Plan(
         vf=f"stateful elastic collapse ({mode}) frame pass",
         out_suffix=ctx.suffix or "_COLLAPSED", width=width, height=height,
         notes=[
-            "nonuniform content-aware displacement with fixed output dimensions",
-            "elastic mode uses seeded smooth fields and CPU OpenCV remapping",
-            "offline seam mode analyzes at most 192px, up to 4 seams per axis at 5Hz",
+            "content-aware mode linearly shrinks over the clip and remaps to original dimensions",
+            "seam analysis is capped at 192px; target scales remove at most half of either axis",
+            "elastic mode remains available for seeded smooth fields and CPU OpenCV remapping",
             "needs requirements-collapse.txt; no stateful preview or original VFR PTS",
         ],
     )
@@ -2111,8 +2112,8 @@ EFFECTS = [
                "pass 2: ffmpeg -f concat -i list.txt -c copy <output>.mp4",
            )),
     Effect(key="collapse", name="elastic collapse",
-           blurb="content-aware elastic deformation or offline seam collapse",
-           tag="stateful CPU displacement and remap",
+           blurb="progressive content-aware scaling or elastic warp",
+           tag="stateful seam carving and CPU remap",
            build=build_collapse, params=COLLAPSE_PARAMS,
            frame_processor=ElasticCollapse,
            stages=(
@@ -2601,6 +2602,8 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
             factory = effect.frame_processor
             processor = factory()
             opts = opts_of(ctx.opts, effect)
+            if factory is ElasticCollapse:
+                opts["_clip_duration"] = clip.duration
             seed = int(opts.get("seed", 0) or 0)
             if not seed:
                 seed = 20261023 + (clip.size % 1000003)
