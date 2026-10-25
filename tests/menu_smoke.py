@@ -19,6 +19,7 @@ from pty_driver import PtyDriver  # noqa: E402
 UP = b"\x1bOA"
 DOWN = b"\x1bOB"
 RIGHT = b"\x1bOC"
+LEFT = b"\x1bOD"
 ENTER = b"\r"
 
 
@@ -860,8 +861,8 @@ def scenario_collapse(c: Checker):
                     press_and_wait(d, UP)
                 c.check("collapse elastic: legacy warp mode can be selected",
                         "elastic warp" in last_frame(d))
-            press_and_wait(d, RIGHT)
-            c.check(f"collapse {mode}: intensity is editable", "70%" in last_frame(d))
+            press_and_wait(d, LEFT)
+            c.check(f"collapse {mode}: intensity is editable", "95%" in last_frame(d))
             if mode == "seam":
                 for _ in range(4):
                     press_and_wait(d, DOWN)

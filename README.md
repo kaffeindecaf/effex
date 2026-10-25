@@ -113,21 +113,21 @@ previews, and chain in either order without extra dependencies.
 `collapse` lives under **SHAPE & MOTION**. The default `seam` mode behaves like
 Photoshop content-aware scaling: each frame starts at its original composition,
 then its content-aware shrink grows linearly from the first frame to the clip's
-end. Low-energy seams are removed from a reduced analysis frame, and the carved
-coordinate map is stretched back over the original canvas, so output dimensions
-never change. High-gradient regions resist shrinking. Analysis is capped at 192
-pixels on the longest side and updates at most five times per second; the
-displacement field is smoothed between updates. `mode=elastic` keeps the earlier
-seeded, spatially nonuniform elastic warp available as an alternative.
+end. Low-energy seams are removed from a reduced analysis frame. The renderer
+inverts that seam-removal displacement so the content shrinks, then maps it to
+the original canvas dimensions. High-gradient regions resist shrinking.
+Analysis is capped at 192 pixels on the longest side and updates at most five
+times per second; the displacement field is smoothed between updates.
+`mode=elastic` keeps the earlier seeded, spatially nonuniform elastic warp.
 
 | option | range / values | default |
 | --- | --- | --- |
-| `intensity` | 0-100%, overall scale strength (elastic warp strength in elastic mode) | 65% |
-| `horizontal` | 0-100%, share of the maximum width shrink / horizontal warp | 65% |
-| `vertical` | 0-100%, share of the maximum height shrink / vertical warp | 45% |
+| `intensity` | 0-100%, overall scale strength (elastic warp strength in elastic mode) | 100% |
+| `horizontal` | 0-100%, share of the maximum width shrink / horizontal warp | 100% |
+| `vertical` | 0-100%, share of the maximum height shrink / vertical warp | 100% |
 | `preserve` | 0-100%, content/edge protection | 75% |
 | `mode` | seam, elastic | seam |
-| `seam_strength` | 0-100%, maximum content-aware shrink by clip end | 60% |
+| `seam_strength` | 0-100%, maximum content-aware shrink by clip end | 100% |
 | `motion` | 0-100%, elastic motion influence | 50% |
 | `smoothness` | 0-100%, spatial field smoothness | 70% |
 | `speed` | 0-4 elastic cycles per second | 0.35 |
@@ -161,18 +161,18 @@ The report measures processor frame time and peak process RSS at 640x360 and
 end-to-end playback guarantee. Seam mode also reports carving-update time.
 
 Recorded on this Linux x86_64 host with one OpenCV CPU thread, 120 frames per
-case, Python 3.14, NumPy 2.5.4 and OpenCV 5.0 (raw data in
+case, Python 3.13.5, NumPy 2.2.4 and OpenCV 4.12.0 (raw data in
 `benchmarks/collapse.json`):
 
 | mode | frame size | mean ms/frame | p95 ms/frame | peak process RSS |
 | --- | --- | --- | --- | --- |
-| elastic | 640x360 | 4.55 | 7.02 | 72.8 MiB |
-| elastic | 1280x720 | 11.57 | 12.30 | 119.1 MiB |
-| seam | 640x360 | 3.43 | 6.37 | 68.1 MiB |
-| seam | 1280x720 | 9.72 | 13.20 | 119.1 MiB |
+| elastic | 640x360 | 4.23 | 4.57 | 63.3 MiB |
+| elastic | 1280x720 | 9.79 | 10.60 | 110.1 MiB |
+| seam | 640x360 | 16.59 | 89.64 | 62.6 MiB |
+| seam | 1280x720 | 25.31 | 123.05 | 109.0 MiB |
 
 Seam averages include frames reusing a cached map; carving-update frames alone
-averaged 6.68 ms at 360p and 12.87 ms at 720p. Persistent state was about
+averaged 89.37 ms at 360p and 109.63 ms at 720p. Persistent state was about
 0.38 MiB for elastic and 0.53 MiB for seam mode in these cases. These are
 measurements of this fixture on this host, not a promise for every input.
 
