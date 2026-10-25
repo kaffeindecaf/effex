@@ -53,8 +53,8 @@ uses FFmpeg's `-enc_time_base demux` option (tested with FFmpeg 7.1).
 ./effex.py lobotomy+neon input/clip.mp4 --set lobotomy.kill=g --set neon.period=2
 ./effex.py sediment input/clip.mp4 --set intensity=70 --set layers=3 --set excavation=10 --set seed=123
 ./effex.py sediment+deepfry input/clip.mp4 --set sediment.decay=30 --set sediment.color=warm --set deepfry.strength=60
-./effex.py collapse input/clip.mp4 --set intensity=80 --set seed=17
-./effex.py collapse input/clip.mp4 --set mode=seam --set seam_strength=80
+./effex.py collapse input/clip.mp4 --set block_size=5 --set mosh=70
+./effex.py collapse input/clip.mp4 --set mode=elastic --set seed=17
 ./effex.py inversion input/clip.mp4 --set lookahead=0.5 --set offset=0.3 --set region=bands
 ./effex.py datamosh input/a.mp4 --set second=input/b.mp4 --set cut=dice --set survival=50 --set seed=123
 ./effex.py stretch input/clip.mp4 --dry-run
@@ -119,6 +119,10 @@ the original canvas dimensions. High-gradient regions resist shrinking.
 Analysis is capped at 192 pixels on the longest side and updates at most five
 times per second; the displacement field is smoothed between updates.
 `mode=elastic` keeps the earlier seeded, spatially nonuniform elastic warp.
+Both modes finish with a reduced-resolution pixel grid enlarged using nearest
+neighbors. Moving regions can borrow a limited blend of the previous frame's
+blocks for a codec-mosh-like trail; the effect does not modify codec packets or
+perform full datamoshing.
 
 | option | range / values | default |
 | --- | --- | --- |
@@ -133,6 +137,8 @@ times per second; the displacement field is smoothed between updates.
 | `speed` | 0-4 elastic cycles per second | 0.35 |
 | `coherence` | 0-100%, elapsed-time field smoothing | 80% |
 | `seed` | 0-2147483647; elastic mode only, 0 derives phases from the source | 0 |
+| `block_size` | 1-16 reduced-grid cells; larger means chunkier pixels | 4 |
+| `mosh` | 0-100%, motion-triggered previous-block carry (up to 50% mix) | 60% |
 
 In seam mode, shrink is capped at 50% per axis. The target reduction is
 `50% × intensity × seam_strength × horizontal/vertical control`; `preserve`
@@ -142,8 +148,10 @@ at source dimensions. `smoothness` and `coherence` steady the reduced-resolution
 seam map; motion, speed, and random phases apply only to elastic mode.
 
 Zero intensity is an exact passthrough; two zero axis scales disable both modes.
-Zero seam strength disables seam mode. Seam mode leaves the first frame
-unchanged and reaches its configured scale at the end of the clip.
+Zero seam strength disables seam mode. Seam geometry starts at identity and
+reaches its configured scale at clip end; the pixel-mosh texture applies from
+the first active frame.
+`block_size=1` with `mosh=0` disables the pixel-mosh texture.
 State resets on a new input/shape, explicit reset, rewind, frame discontinuity,
 explicit scene cut, or a large RGB scene change. Persistent analysis state is
 bounded independently of clip length; full-frame remap buffers are transient.
@@ -166,14 +174,14 @@ case, Python 3.13.5, NumPy 2.2.4 and OpenCV 4.12.0 (raw data in
 
 | mode | frame size | mean ms/frame | p95 ms/frame | peak process RSS |
 | --- | --- | --- | --- | --- |
-| elastic | 640x360 | 4.23 | 4.57 | 63.3 MiB |
-| elastic | 1280x720 | 9.79 | 10.60 | 110.1 MiB |
-| seam | 640x360 | 16.59 | 89.64 | 62.6 MiB |
-| seam | 1280x720 | 25.31 | 123.05 | 109.0 MiB |
+| elastic | 640x360 | 5.44 | 6.25 | 64.4 MiB |
+| elastic | 1280x720 | 13.62 | 15.43 | 110.5 MiB |
+| seam | 640x360 | 22.62 | 117.82 | 63.5 MiB |
+| seam | 1280x720 | 32.13 | 127.87 | 108.1 MiB |
 
 Seam averages include frames reusing a cached map; carving-update frames alone
-averaged 89.37 ms at 360p and 109.63 ms at 720p. Persistent state was about
-0.38 MiB for elastic and 0.53 MiB for seam mode in these cases. These are
+averaged 116.51 ms at 360p and 127.58 ms at 720p. Persistent state was about
+0.38 MiB for elastic and 0.54 MiB for seam mode in these cases. These are
 measurements of this fixture on this host, not a promise for every input.
 
 ## causality inversion

@@ -376,15 +376,18 @@ Shared rules for the stateful effects:
 - [x] E2.46 - content-aware scaling and elastic warp (prompt effect 05): change image composition while preserving output dimensions.
   - Default to progressive content-aware scale: linearly ramp seam-carved shrink from identity at clip start to the configured target at clip end, then remap each frame to its original canvas.
   - Analyze at reduced resolution, preserve high-energy regions, cap shrink to half per axis, and smooth cached decisions. Keep the earlier seeded elastic warp as an alternate mode.
-  - Options: intensity, horizontal/vertical shrink, content preservation, seam strength/mode, elastic motion influence, field smoothness/speed, temporal coherence, seed.
-  - Test linear progress against clip duration, fixed output size, content preservation, repeatability, bounded state and real CLI/menu renders.
+  - Options: intensity, horizontal/vertical shrink, content preservation, seam strength/mode, pixel block size, motion-block carry, elastic motion influence, field smoothness/speed, temporal coherence, seed.
+  - Test linear progress against clip duration, fixed output size, content preservation, pixelation, motion-block carry, repeatability, bounded state and real CLI/menu renders.
   _Done: `collapse` defaults to a content-aware seam scale that begins at the
   source composition and grows linearly to its target over probed clip duration.
   The low-resolution energy map removes seams from low-detail regions, and the
   renderer inverts that displacement so salient content shrinks instead of
   growing. Each output is mapped to the original frame dimensions. Analysis is
   capped at 192px; shrink is limited to 50% per axis and refreshed at <=5Hz with
-  temporal smoothing. The seeded elastic warp remains selectable.
+  temporal smoothing. A nearest-neighbor reduced pixel grid adds chunky output;
+  motion-triggered blocks blend at most half of their prior-frame value for a
+  restrained codec-mosh texture without bitstream corruption. The seeded
+  elastic warp remains selectable.
   Duration flows through the shared stateful adapter. Tests cover exact start,
   linear midpoint field, end-frame deformation, output shape/audio, resets,
   preservation, optional dependencies and TUI/CLI integration. Optional headless

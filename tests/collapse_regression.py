@@ -176,6 +176,7 @@ class CollapseTests(unittest.TestCase):
         self.assertEqual([defaults[key] for key in
                           ("intensity", "horizontal", "vertical", "seam_strength")],
                          [100, 100, 100, 100])
+        self.assertEqual((defaults["block_size"], defaults["mosh"]), (4, 60))
 
     def test_seam_mode_is_distinct_and_zero_strength_disables_it(self):
         frame = self.frame()
@@ -193,7 +194,8 @@ class CollapseTests(unittest.TestCase):
         frame = self.frame()
         processor = self.processor(
             mode="seam", intensity=100, horizontal=100, vertical=0,
-            preserve=0, seam_strength=100, coherence=0, _clip_duration=2,
+            preserve=0, seam_strength=100, coherence=0, block_size=1, mosh=0,
+            _clip_duration=2,
         )
         first = processor.process(frame, 0, 0.0, {})
         first_field = processor.displacement.copy()
@@ -214,12 +216,53 @@ class CollapseTests(unittest.TestCase):
         frame[20:44, 30:66] = 255
         processor = self.processor(
             mode="seam", intensity=100, horizontal=100, vertical=0,
-            preserve=100, seam_strength=100, coherence=0, _clip_duration=1,
+            preserve=100, seam_strength=100, coherence=0, block_size=1, mosh=0,
+            _clip_duration=1,
         )
         out = processor.process(frame, 30, 1.0, {})
         ys, xs = np.where(out.mean(axis=2) > 128)
         self.assertEqual(out.shape, frame.shape)
         self.assertLess(int(np.ptp(xs)) + 1, 36)
+
+    def test_block_size_reduces_high_frequency_detail(self):
+        y, x = np.indices((64, 96))
+        checker = (((x + y) % 2) * 255).astype(np.uint8)
+        frame = np.repeat(checker[:, :, None], 3, axis=2)
+        fine = self.processor(mode="seam", block_size=1, mosh=0, preserve=0)
+        chunky = self.processor(mode="seam", block_size=4, mosh=0, preserve=0)
+        fine_out = fine.process(frame, 0, 0.0, {})
+        chunky_out = chunky.process(frame, 0, 0.0, {})
+        fine_edges = np.count_nonzero(np.diff(fine_out[32, :, 0]))
+        chunky_edges = np.count_nonzero(np.diff(chunky_out[32, :, 0]))
+
+        self.assertEqual(chunky_out.shape, frame.shape)
+        self.assertLess(chunky_edges, fine_edges / 2)
+
+    def test_mosh_carries_old_blocks_only_when_content_moves(self):
+        before = np.zeros((64, 96, 3), dtype=np.uint8)
+        before[20:44, 8:32] = 255
+        after = np.zeros_like(before)
+        after[20:44, 56:80] = 255
+
+        def run(mosh):
+            processor = self.processor(
+                mode="seam", block_size=4, mosh=mosh, preserve=0,
+                coherence=0, _clip_duration=1,
+            )
+            processor.process(before, 0, 0.0, {})
+            return processor.process(after, 1, 0.0, {})
+
+        clean = run(0)
+        carried = run(80)
+        self.assertEqual(carried.shape, after.shape)
+        self.assertGreater(float(np.abs(carried.astype(float) - clean).mean()), 2)
+
+        def run_static(mosh):
+            processor = self.processor(mode="seam", block_size=4, mosh=mosh)
+            processor.process(before, 0, 0.0, {})
+            return processor.process(before, 1, 1 / 30, {})
+
+        np.testing.assert_array_equal(run_static(0), run_static(80))
 
     def test_seam_updates_are_rate_limited_and_deterministic(self):
         frame = self.frame()
@@ -261,6 +304,7 @@ class CollapseTests(unittest.TestCase):
                 "--set", "mode=seam", "--set", "intensity=100",
                 "--set", "horizontal=100", "--set", "vertical=100",
                 "--set", "preserve=0", "--set", "seam_strength=100",
+                "--set", "block_size=1", "--set", "mosh=0",
                 "--json", "--preset", "ultrafast",
             ], env_extra=env)
             self.assertEqual(proc.returncode, 0, proc.stderr.decode())
@@ -295,6 +339,7 @@ class CollapseTests(unittest.TestCase):
             for setting in ("intensity=101", "horizontal=-1", "vertical=101",
                             "preserve=101", "mode=unknown", "seam_strength=101",
                             "motion=-1", "smoothness=101", "speed=-1", "speed=5",
+                            "block_size=0", "block_size=17", "mosh=-1", "mosh=101",
                             "coherence=101", "seed=-1"):
                 with self.subTest(invalid=setting):
                     proc = run([EFFEX, "collapse", clip, "--set", setting,
