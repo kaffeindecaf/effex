@@ -16,6 +16,7 @@ from harness import (Checker, EFFEX, audio_codec, env_for,  # noqa: E402
                      make_clip, require_tools, temp_folders, video_dims)
 from pty_driver import PtyDriver  # noqa: E402
 
+UP = b"\x1bOA"
 DOWN = b"\x1bOB"
 RIGHT = b"\x1bOC"
 ENTER = b"\r"
@@ -827,7 +828,7 @@ def scenario_psychedelic(c: Checker):
 
 
 def scenario_collapse(c: Checker):
-    """elastic and offline seam modes share controls and the normal renderer"""
+    """progressive content-aware scaling and elastic warp share the renderer"""
     import importlib.util
     from harness import newest_mp4
 
@@ -849,15 +850,23 @@ def scenario_collapse(c: Checker):
             c.check(f"collapse {mode}: controls present", all(
                 label in last_frame(d) for label in
                 ("horizontal deformation amount", "vertical deformation amount",
-                 "protect strong edges", "seam strength",
+                 "protect strong edges", "shrink amount",
                  "smooth field changes", "random seed")))
+            if mode == "elastic":
+                for _ in range(4):
+                    press_and_wait(d, DOWN)
+                press_and_wait(d, RIGHT)
+                for _ in range(4):
+                    press_and_wait(d, UP)
+                c.check("collapse elastic: legacy warp mode can be selected",
+                        "elastic warp" in last_frame(d))
             press_and_wait(d, RIGHT)
             c.check(f"collapse {mode}: intensity is editable", "70%" in last_frame(d))
             if mode == "seam":
                 for _ in range(4):
                     press_and_wait(d, DOWN)
-                press_and_wait(d, RIGHT)
-                c.check("collapse seam: offline mode can be selected", "seam (offline)" in last_frame(d))
+                c.check("collapse seam: content-aware scale is the default",
+                        "content-aware scale" in last_frame(d))
             c.check(f"collapse {mode}: no unsupported preview key", "p preview" not in last_frame(d))
             d.send(b"r")
             c.check(f"collapse {mode}: confirm opens", wait_last(d, "render this video?"))
