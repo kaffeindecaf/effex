@@ -293,8 +293,8 @@ class ElasticCollapse:
     MAX_WORK_SIDE = 192
     MAX_STATE_BYTES = 4 * 1024 * 1024
     DEFAULTS = {
-        "intensity": 65, "horizontal": 65, "vertical": 45, "preserve": 75,
-        "mode": "seam", "seam_strength": 60, "motion": 50,
+        "intensity": 100, "horizontal": 100, "vertical": 100, "preserve": 75,
+        "mode": "seam", "seam_strength": 100, "motion": 50,
         "smoothness": 70, "speed": 0.35, "coherence": 80, "seed": 0,
     }
 
@@ -383,7 +383,7 @@ class ElasticCollapse:
         """A copy of the applied normalized (dx, dy) field for diagnostics."""
         if self._field is None:
             return None
-        amount = (self._progress if self._config["mode"] == "seam"
+        amount = (-self._progress if self._config["mode"] == "seam"
                   else self._config["intensity"] / 100.0)
         return self._field * amount
 
@@ -501,7 +501,8 @@ class ElasticCollapse:
                 or not (self._config["horizontal"] or self._config["vertical"])):
             return frame.copy()
         full = cv.resize(self._field, (width, height), interpolation=cv.INTER_LINEAR)
-        amount = (self._progress if self._config["mode"] == "seam"
+        # Seam removal's resize map expands the retained content; invert it to shrink.
+        amount = (-self._progress if self._config["mode"] == "seam"
                   else intensity)
         map_x = full[:, :, 0] * (amount * max(0, width - 1))
         map_y = full[:, :, 1] * (amount * max(0, height - 1))

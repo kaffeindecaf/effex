@@ -1918,11 +1918,11 @@ def build_temporal_sediment(ctx: EffectContext) -> Plan:
 
 COLLAPSE_PARAMS = (
     Param("intensity", "intensity", "how strongly the displacement is applied",
-          "percent", 65, minimum=0, maximum=100, step=5),
+          "percent", 100, minimum=0, maximum=100, step=5),
     Param("horizontal", "horizontal scale", "horizontal deformation amount",
-          "percent", 65, minimum=0, maximum=100, step=5),
+          "percent", 100, minimum=0, maximum=100, step=5),
     Param("vertical", "vertical scale", "vertical deformation amount",
-          "percent", 45, minimum=0, maximum=100, step=5),
+          "percent", 100, minimum=0, maximum=100, step=5),
     Param("preserve", "content preservation", "protect strong edges from collapse",
           "percent", 75, minimum=0, maximum=100, step=5),
     Param("mode", "mode", "progressive content-aware scaling or elastic warping",
@@ -1932,7 +1932,7 @@ COLLAPSE_PARAMS = (
               ("elastic", "elastic warp", "smooth content-weighted CPU remapping"),
           )),
     Param("seam_strength", "shrink amount", "maximum content-aware shrink by the end of the clip",
-          "percent", 60, minimum=0, maximum=100, step=5),
+          "percent", 100, minimum=0, maximum=100, step=5),
     Param("motion", "motion influence", "amplify elastic deformation in moving regions",
           "percent", 50, minimum=0, maximum=100, step=5),
     Param("smoothness", "field smoothness", "larger, smoother deformation regions",

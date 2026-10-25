@@ -171,7 +171,11 @@ class CollapseTests(unittest.TestCase):
         effect = effex.EFFECT_BY_KEY["collapse"]
         self.assertEqual({p.key for p in effect.params}, set(stateful_effects.ElasticCollapse.DEFAULTS))
         self.assertIs(effect.frame_processor, stateful_effects.ElasticCollapse)
-        self.assertEqual(effex.default_opts(effect)["mode"], "seam")
+        defaults = effex.default_opts(effect)
+        self.assertEqual(defaults["mode"], "seam")
+        self.assertEqual([defaults[key] for key in
+                          ("intensity", "horizontal", "vertical", "seam_strength")],
+                         [100, 100, 100, 100])
 
     def test_seam_mode_is_distinct_and_zero_strength_disables_it(self):
         frame = self.frame()
@@ -204,6 +208,18 @@ class CollapseTests(unittest.TestCase):
         self.assertEqual(middle.shape, frame.shape)
         self.assertEqual(final.shape, frame.shape)
         self.assertGreater(float(np.abs(final.astype(float) - frame).mean()), 4)
+
+    def test_content_aware_scale_shrinks_the_salient_subject(self):
+        frame = np.zeros((64, 96, 3), dtype=np.uint8)
+        frame[20:44, 30:66] = 255
+        processor = self.processor(
+            mode="seam", intensity=100, horizontal=100, vertical=0,
+            preserve=100, seam_strength=100, coherence=0, _clip_duration=1,
+        )
+        out = processor.process(frame, 30, 1.0, {})
+        ys, xs = np.where(out.mean(axis=2) > 128)
+        self.assertEqual(out.shape, frame.shape)
+        self.assertLess(int(np.ptp(xs)) + 1, 36)
 
     def test_seam_updates_are_rate_limited_and_deterministic(self):
         frame = self.frame()

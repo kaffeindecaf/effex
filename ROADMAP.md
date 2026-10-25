@@ -380,10 +380,11 @@ Shared rules for the stateful effects:
   - Test linear progress against clip duration, fixed output size, content preservation, repeatability, bounded state and real CLI/menu renders.
   _Done: `collapse` defaults to a content-aware seam scale that begins at the
   source composition and grows linearly to its target over probed clip duration.
-  The low-resolution energy map removes seams from low-detail regions, then the
-  source-coordinate map is stretched back to the original frame dimensions.
-  Analysis is capped at 192px; shrink is limited to 50% per axis and refreshed
-  at <=5Hz with temporal smoothing. The seeded elastic warp remains selectable.
+  The low-resolution energy map removes seams from low-detail regions, and the
+  renderer inverts that displacement so salient content shrinks instead of
+  growing. Each output is mapped to the original frame dimensions. Analysis is
+  capped at 192px; shrink is limited to 50% per axis and refreshed at <=5Hz with
+  temporal smoothing. The seeded elastic warp remains selectable.
   Duration flows through the shared stateful adapter. Tests cover exact start,
   linear midpoint field, end-frame deformation, output shape/audio, resets,
   preservation, optional dependencies and TUI/CLI integration. Optional headless
