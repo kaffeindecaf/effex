@@ -1943,6 +1943,10 @@ COLLAPSE_PARAMS = (
           "percent", 80, minimum=0, maximum=100, step=5),
     Param("seed", "random seed", "0 derives repeatable elastic phases from the clip",
           "int", 0, minimum=0, maximum=2147483647, step=1),
+    Param("block_size", "pixel blocks", "larger blocks make the output chunkier",
+          "int", 4, minimum=1, maximum=16, step=1),
+    Param("mosh", "block carry", "blend prior-frame blocks in moving areas; not codec datamosh",
+          "percent", 60, minimum=0, maximum=100, step=5),
 )
 
 
@@ -1955,6 +1959,7 @@ def build_collapse(ctx: EffectContext) -> Plan:
         notes=[
             "content-aware mode linearly shrinks over the clip and remaps to original dimensions",
             "seam analysis is capped at 192px; target scales remove at most half of either axis",
+            "a reduced pixel grid and partial moving-block carry add a restrained codec-mosh texture",
             "elastic mode remains available for seeded smooth fields and CPU OpenCV remapping",
             "needs requirements-collapse.txt; no stateful preview or original VFR PTS",
         ],
@@ -2112,8 +2117,8 @@ EFFECTS = [
                "pass 2: ffmpeg -f concat -i list.txt -c copy <output>.mp4",
            )),
     Effect(key="collapse", name="elastic collapse",
-           blurb="progressive content-aware scaling or elastic warp",
-           tag="stateful seam carving and CPU remap",
+           blurb="progressive content-aware scale with pixelated block mosh",
+           tag="seam carve, pixel grid, motion block carry",
            build=build_collapse, params=COLLAPSE_PARAMS,
            frame_processor=ElasticCollapse,
            stages=(

@@ -283,11 +283,12 @@ class TemporalSediment:
 
 
 class ElasticCollapse:
-    """Progressive content-aware scaling or elastic warp with bounded state.
+    """Progressive content-aware scaling with pixel-mosh texture.
 
     Seam mode linearly scales a reduced-resolution carved field over clip time;
-    elastic mode evolves a seeded nonuniform field. OpenCV is loaded only on
-    initialization; full-size maps are transient and analysis stays bounded.
+    elastic mode evolves a seeded nonuniform field. A bounded pixel grid adds
+    blocky output, with limited previous-frame carry in moving areas. OpenCV is
+    loaded only on initialization; full-size maps are transient.
     """
 
     MAX_WORK_SIDE = 192
@@ -296,6 +297,7 @@ class ElasticCollapse:
         "intensity": 100, "horizontal": 100, "vertical": 100, "preserve": 75,
         "mode": "seam", "seam_strength": 100, "motion": 50,
         "smoothness": 70, "speed": 0.35, "coherence": 80, "seed": 0,
+        "block_size": 4, "mosh": 60,
     }
 
     def __init__(self):
@@ -313,6 +315,7 @@ class ElasticCollapse:
         self._phase: Any = None
         self._field: Any = None
         self._previous_rgb: Any = None
+        self._previous_mosh_grid: Any = None
         self._previous_timestamp: Optional[float] = None
         self._next_index: Optional[int] = None
         self._clock = 0.0
@@ -352,6 +355,8 @@ class ElasticCollapse:
                 self._config[key] = mode
             else:
                 high = 4.0 if key == "speed" else (2147483647 if key == "seed" else 100)
+                if key == "block_size":
+                    high = 16
                 number = self._number(config.get(key, default), default, 0, high)
                 self._config[key] = number if key == "speed" else int(number)
         self._fps = self._number(fps, 30.0, 0.001, 1000)
@@ -375,7 +380,7 @@ class ElasticCollapse:
     def state_nbytes(self) -> int:
         return sum(int(value.nbytes) for value in
                    (self._x, self._y, self._phase, self._field, self._previous_rgb,
-                    self._seam_target)
+                    self._seam_target, self._previous_mosh_grid)
                    if value is not None)
 
     @property
@@ -396,6 +401,7 @@ class ElasticCollapse:
         self._phase = self._np.random.default_rng(self._seed).uniform(0, 2 * math.pi, 4)
         self._field = None
         self._previous_rgb = None
+        self._previous_mosh_grid = None
         self._previous_timestamp = None
         self._next_index = None
         self._clock = 0.0
@@ -451,6 +457,38 @@ class ElasticCollapse:
             field *= (1 + self._config["motion"] / 100.0 * moving)[:, :, None]
         return field.astype(np.float32)
 
+    def _pixel_mosh(self, frame, motion_delta):
+        """Pixelate on the bounded work grid and carry old blocks in motion areas."""
+        np, cv = self._np, self._cv
+        block_size = self._config["block_size"]
+        mosh = self._config["mosh"] / 100.0
+        if block_size == 1 and mosh == 0:
+            self._previous_mosh_grid = None
+            return frame
+
+        work_height, work_width = self._work_shape
+        height, width = frame.shape[:2]
+        reduced = cv.resize(frame, (work_width, work_height),
+                            interpolation=cv.INTER_AREA)
+        step = max(1, block_size)
+        grid_width = max(1, (work_width + step - 1) // step)
+        grid_height = max(1, (work_height + step - 1) // step)
+        current_grid = cv.resize(reduced, (grid_width, grid_height),
+                                 interpolation=cv.INTER_AREA)
+        styled = current_grid.astype(np.float32)
+        if (mosh and motion_delta is not None
+                and self._previous_mosh_grid is not None):
+            motion_grid = cv.resize(motion_delta.astype(np.float32),
+                                    (grid_width, grid_height),
+                                    interpolation=cv.INTER_AREA)
+            moving = np.clip((motion_grid - 4.0) / 48.0, 0.0, 1.0)
+            weight = (moving * (0.5 * mosh))[:, :, None]
+            previous = self._previous_mosh_grid.astype(np.float32)
+            styled = styled * (1.0 - weight) + previous * weight
+        self._previous_mosh_grid = current_grid.copy()
+        styled = np.clip(np.rint(styled), 0, 255).astype(np.uint8)
+        return cv.resize(styled, (width, height), interpolation=cv.INTER_NEAREST)
+
     def process(self, frame, frame_index: int, timestamp: Optional[float],
                 context: Optional[dict] = None):
         if self._np is None:
@@ -471,6 +509,9 @@ class ElasticCollapse:
         if ((self._next_index is not None and index != self._next_index)
                 or rewind or cut or (context or {}).get("scene_cut")):
             self.reset()
+        motion_delta = (np.abs(current.astype(np.float32)
+                               - self._previous_rgb.astype(np.float32)).mean(axis=2)
+                        if self._previous_rgb is not None else None)
         if self._config["mode"] == "seam":
             self._progress = (
                 min(1.0, max(0.0, stamp / self._clip_duration))
@@ -508,8 +549,9 @@ class ElasticCollapse:
         map_y = full[:, :, 1] * (amount * max(0, height - 1))
         map_x += np.arange(width, dtype=np.float32)[None, :]
         map_y += np.arange(height, dtype=np.float32)[:, None]
-        return cv.remap(frame, map_x, map_y, interpolation=cv.INTER_LINEAR,
-                        borderMode=cv.BORDER_REFLECT_101)
+        warped = cv.remap(frame, map_x, map_y, interpolation=cv.INTER_LINEAR,
+                          borderMode=cv.BORDER_REFLECT_101)
+        return self._pixel_mosh(warped, motion_delta)
 
 
 class CausalityInversion:

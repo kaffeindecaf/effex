@@ -852,7 +852,8 @@ def scenario_collapse(c: Checker):
                 label in last_frame(d) for label in
                 ("horizontal deformation amount", "vertical deformation amount",
                  "protect strong edges", "shrink amount",
-                 "smooth field changes", "random seed")))
+                 "smooth field changes", "random seed", "pixel blocks",
+                 "block carry")))
             if mode == "elastic":
                 for _ in range(4):
                     press_and_wait(d, DOWN)
