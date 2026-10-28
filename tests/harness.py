@@ -47,11 +47,18 @@ class Checker:
 
 def run(args, stdin: bytes = b"", env_extra: Optional[dict] = None,
         timeout: int = 300, cwd=None):
-    """run effex (or anything) with a piped, non-tty stdin"""
+    """run effex (or anything) with a piped, non-tty stdin.
+
+    windows cannot execute a .py file directly (no shebang support), so the
+    interpreter is put in front there; on unix the shebang path stays tested
+    """
+    argv = [str(a) for a in args]
+    if os.name == "nt" and argv and argv[0].lower().endswith(".py"):
+        argv = [sys.executable] + argv
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
-    proc = subprocess.run([str(a) for a in args], input=stdin, env=env,
+    proc = subprocess.run(argv, input=stdin, env=env,
                           capture_output=True, timeout=timeout,
                           cwd=str(cwd or REPO))
     return proc

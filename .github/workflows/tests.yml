@@ -43,12 +43,27 @@ jobs:
           }
           ffmpeg -version | Select-Object -First 1
           ffprobe -version | Select-Object -First 1
-      - name: platform, requirements and cli checks
+      - name: platform + installer tables
         shell: pwsh
         run: |
           python tests/platform_support.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: diagnostics log
+        shell: pwsh
+        run: |
           python tests/logging_regression.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: cli regression
+        shell: pwsh
+        run: |
           python tests/cli_regression.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: requirement check on windows
+        shell: pwsh
+        run: |
           python -c "import diagnostics, os; p = diagnostics.log_dir(); print(p); assert 'effex' in str(p).lower() and os.environ['LOCALAPPDATA'].lower() in str(p).lower(), p"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           python effex.py --check --json
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           python effex.py --list
+          if ($LASTEXITCODE -ne 0) { exit 1 }

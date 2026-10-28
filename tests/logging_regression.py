@@ -16,6 +16,7 @@ import contextlib
 import io
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -49,7 +50,8 @@ def main() -> int:
 
     session = diagnostics.Session()
     session.start(version="9.9.9", argv=["stretch", "clip.mp4"], cwd="/tmp/x")
-    session.bind("ffmpeg", "/bin/ffmpeg")
+    real_ffmpeg = shutil.which("ffmpeg")
+    session.bind("ffmpeg", real_ffmpeg or "/bin/ffmpeg")
     c.check("nothing is written before an event", not session.exists())
     session.warn("ffmpeg is missing")
     c.check("a warning creates the file", session.exists())
@@ -59,9 +61,14 @@ def main() -> int:
             "effex stretch clip.mp4" in text, text)
     c.check("the header carries platform and python",
             "platform" in text and "python" in text)
-    c.check("the header carries the tool paths and versions",
-            "/bin/ffmpeg" in text and re.search(r"ffmpeg v\s+\d", text)
-            is not None, text)
+    # the version line only exists when the bound binary can actually run
+    if real_ffmpeg:
+        c.check("the header carries the tool paths and versions",
+                real_ffmpeg in text
+                and re.search(r"ffmpeg v\s+\d", text) is not None, text)
+    else:
+        c.check("the header carries the tool path", "/bin/ffmpeg" in text,
+                text)
     c.check("the event line is timestamped and levelled",
             any(EVENT.match(line) and "warn" in line
                 for line in text.splitlines()), text)
