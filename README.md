@@ -43,6 +43,19 @@ presentation timestamps. Install `requirements-inversion.txt`; its aligned mode
 also needs `requirements-collapse.txt` for CPU optical flow. Timestamped export
 uses FFmpeg's `-enc_time_base demux` option (tested with FFmpeg 7.1).
 
+For optional effects on systems with externally managed Python, use a local
+environment rather than installing into the system interpreter:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-collapse.txt -r requirements-inversion.txt
+```
+
+Plain `./effex.py` and installed `effex` launches use `.venv/bin/python3` when
+present. An already-active virtual environment is respected; `python -S` keeps
+its explicit no-site behavior. Failed renders now keep the underlying error on
+the completion screen instead of showing only "no output file was written".
+
 ## commands
 
 ```sh
@@ -53,10 +66,12 @@ uses FFmpeg's `-enc_time_base demux` option (tested with FFmpeg 7.1).
 ./effex.py lobotomy+neon input/clip.mp4 --set lobotomy.kill=g --set neon.period=2
 ./effex.py sediment input/clip.mp4 --set intensity=70 --set layers=3 --set excavation=10 --set seed=123
 ./effex.py sediment+deepfry input/clip.mp4 --set sediment.decay=30 --set sediment.color=warm --set deepfry.strength=60
-./effex.py collapse input/clip.mp4 --set block_size=5 --set mosh=70
+./effex.py collapse input/clip.mp4
+./effex.py collapse input/clip.mp4 --set pixelate=on --set block_size=5 --set mosh=70
 ./effex.py collapse input/clip.mp4 --set mode=elastic --set seed=17
 ./effex.py inversion input/clip.mp4 --set lookahead=0.5 --set offset=0.3 --set region=bands
-./effex.py datamosh input/a.mp4 --set second=input/b.mp4 --set cut=dice --set survival=50 --set seed=123
+./effex.py datamosh input/a.mp4 --with input/b.mp4
+./effex.py archaeology input/clip.mp4 --set metric=texture --set boundary=soft
 ./effex.py stretch input/clip.mp4 --dry-run
 ```
 
@@ -64,13 +79,211 @@ uses FFmpeg's `-enc_time_base demux` option (tested with FFmpeg 7.1).
 
 ## what it does
 
-- effects include stretch, pixelize, deepfry, vhs/crt, dropout, trails, datamosh, timescratch, and temporal sediment.
+- effects include stretch, pixelize, deepfry, vhs/crt, dropout, trails, datamosh, timescratch, temporal sediment, causality inversion, and pixel archaeology.
 - stack single-pass effects with `+`, such as `stretch+deepfry`; order matters.
 - temporal sediment layers the current image over a bounded 1-3 layer history. Tune deposit, decay, motion sensitivity, excavation chance, color memory, and seed; it works with single-pass filters before or after it.
-- datamosh can join two videos in one codec stream. pick the second clip in the menu or pass `--set second=path`; set the trim, keyframe survival, seed, fill, grit, and audio.
+- datamosh defaults to a heavy codec-bloom preset. pick the second clip in the menu or pass `--with path` to mash two videos into one stream.
+- blockswap trades fixed rectangles between seeded positions, can teleport those layouts on a timer and can run a light codec datamosh over the whole clip; see the blockswap section.
 - single-pass previews, render progress, ctrl-c cancellation, and cleanup of partial renders.
 
-datamosh and timescratch use their own multi-pass pipelines, so they cannot be chained with other effects. Temporal sediment uses a bounded 128 MiB history buffer. Without inversion, stateful chains still normalize input to the probed frame rate. Chains containing inversion use timestamped transport and preserve the video presentation timeline, including variable-rate input and nonzero start times. Stateful previews are not available. Multiple stateful processors must be adjacent; FFmpeg filters can go before and after them.
+datamosh, timescratch and blockswap use their own multi-pass pipelines, so they cannot be chained with other effects. Temporal sediment uses a bounded 128 MiB history buffer. Without inversion, stateful chains still normalize input to the probed frame rate. Chains containing inversion use timestamped transport and preserve the video presentation timeline, including variable-rate input and nonzero start times. Stateful previews are not available. Multiple stateful processors must be adjacent; FFmpeg filters can go before and after them.
+
+## blockswap
+
+`blockswap` under **CODEC & BLOCKS** swaps rectangular regions of the frame
+between seeded positions. The blocks do not slide: each layout holds until it
+teleports.
+
+```sh
+./effex.py blockswap input/clip.mp4
+./effex.py blockswap input/clip.mp4 --set blocks=5 --set size=15 --set teleport=2
+./effex.py blockswap input/clip.mp4 --set teleport=1 --set mosh=25
+./effex.py blockswap input/clip.mp4 --set seed=17 --set mosh=70 --set mosh_grit=20
+```
+
+| option | range | default | meaning |
+| --- | --- | --- | --- |
+| `size` | 5-60% | 20% | block width and height as a share of the frame |
+| `blocks` | 1-8 | 3 | swapped block pairs (each pair relocates two regions) |
+| `teleport` | 0-30 s | 3 | seconds per layout; 0 keeps one layout for the whole clip |
+| `mosh` | 0-100% | 0 | light codec datamosh over the whole clip; 0 disables |
+| `mosh_grit` | 1-31 | 12 | crunch of the intermediate mpeg4 encode |
+| `mosh_hold` | 2-600 | 12 | keyframe interval in the intermediate encode |
+| `seed` | 0-2147483647 | 0 | 0 derives a repeatable layout from the clip |
+
+Each teleport window gets its own seeded layout, emitted as a `swaprect` filter
+with an `enable='between(t,...)'` guard, so several layouts coexist in one
+command. Windows are capped (`48 / blocks`) so a long clip cannot explode into
+hundreds of filters. Blocks inside one window are kept from overlapping.
+
+`mosh` turns blockswap into a two-pass codec render: the swaprect chain is
+encoded to mpeg4 with `mosh_grit`/`mosh_hold`, recovery keyframes are removed by
+survival `100 - mosh`, motion data is bloomed over `mosh/12` frame slots, and the
+result is remuxed with the source audio. Teleports land in that stream as hard
+prediction breaks, so the blocks themselves smear - which is the point. Higher
+`mosh` keeps fewer keyframes and blooms more. Because it edits the bitstream,
+blockswap cannot be chained with other effects and has no preview; with
+`mosh=0` it is still encoded in a single pass (same filters, normal libx264).
+
+## heavy datamosh
+
+`datamosh` lives under **CODEC & BLOCKS**. Heavy is now the default: remove
+recovery keyframes, crush the MPEG-4 encode, and repeatedly apply short runs of
+P-frame motion/residual data to stale pixels. This is codec-level blooming,
+not a pixel overlay or a repeated decoded still frame.
+
+```sh
+./effex.py datamosh input/a.mp4 --with input/b.mp4
+./effex.py datamosh input/a.mp4 --with input/b.mp4 --set preset=heavy --set bloom=24 --set bloom_window=1
+./effex.py datamosh input/a.mp4 --set preset=standard
+./effex.py datamosh input/a.mp4 --with input/b.mp4 --set second_start=2 --set second_length=3 --set audio=mix
+```
+
+| setting | heavy (default) | standard |
+| --- | --- | --- |
+| `cut` | heavy: remove recovery keyframes | heavy |
+| `fill` | chaos: seeded random motion frame | next motion frame |
+| `hold` | 12-frame keyframe interval | 150 frames |
+| `grit` | 18, visibly crushed | 2, cleaner |
+| `bloom` | reuse motion across 12 frame slots | 1, disabled |
+| `bloom_window` | cycle 2 captured motion frames per burst | 1 |
+
+`bloom` ranges from 1-60 slots, and `bloom_window` from 1-12 motion frames
+(capped to the burst length). Longer bursts and smaller windows sustain the
+same motion for longer. Individual `--set` knobs override the chosen preset
+regardless of argument order. `--set preset=...` is the **mosh** preset;
+`--preset` remains the unrelated x264 encoder option.
+
+In the menu, **second video** is the first row and **mosh preset** is the second.
+Changing the preset loads its codec knobs; they remain editable afterward.
+The options scroll on short terminals. `--set second=path` still works, while
+two positional files still mean two separate batch renders. Use `--with` for
+one combined video.
+
+The second clip is appended, resized/padded and frame-rate-normalized to match
+the first. Its boundary keyframe is removed when compatible, so its motion
+inherits the first clip's stale image instead of making a clean cut. The result
+is sequential, not a simultaneous opacity blend. `audio=auto` joins audio with
+silence for missing tracks; `first`, `second`, `mix` and `none` remain available.
+
+Bloom replaces existing frame slots rather than inserting frames, preserving
+the normalized timeline and audio length. Reused VOPs take the destination
+timestamp; incompatible clock-header lengths keep the original slot so internal
+slice markers cannot shift. A recovery keyframe can survive that safety fallback.
+Very short/static inputs with little prediction data may show less melting.
+The intermediate compressed stream is edited in memory, so memory use scales
+with clip size. No extra packages or custom FFmpeg build are required.
+
+Technique references: [tomato's bloom/pulse modes](https://github.com/GlitchTools/tomato),
+[tiberiuiancu/datamoshing's P-frame reuse](https://github.com/tiberiuiancu/datamoshing),
+and [python-moshion's two-source splice](https://github.com/rjmoggach/python-moshion).
+Effex implements these techniques independently; no repository code is vendored.
+
+## pixel archaeology
+
+`archaeology` (under **TIME & MEMORY**) borrows a cutout from a *future* frame,
+holds it in the present picture, then melts it back into the video. Nothing is
+synthesised: every borrowed pixel is a copy of a frame that has not been shown
+yet, so the picture briefly shows something that has not happened.
+
+The mental model is a sky of drifting clouds. Somewhere in the frame a region of
+cloud sits that looks like the same kind of cloud a fraction of a second later,
+but the cloud has moved. Archaeology cuts that later cloud out, pastes it into
+the present frame under a soft, grown mask, lets it drift with its own motion,
+then dissolves it - blotch by blotch, with a flow-warped smudge - until the live
+frame is back.
+
+```sh
+./effex.py archaeology input/clip.mp4
+./effex.py archaeology input/clip.mp4 --set gap=30 --set size=24 --set pick=dissimilar
+./effex.py archaeology input/clip.mp4 --set mode=slide --set hold=10 --set melt=24
+./effex.py neon+archaeology+deepfry input/clip.mp4 --set archaeology.gap=12
+./effex.py archaeology input/clip.mp4 --set seam=none --set feather=0 --set shape=rect
+```
+
+| option | range / values | default |
+| --- | --- | --- |
+| `lookahead` | 0.1-2.0 s of frames buffered ahead (also the output delay) | 0.6 |
+| `gap` | 1-60 frames ahead the cutout is taken from | 18 |
+| `cutouts` | 1-3 simultaneous cutouts | 1 |
+| `spawn_every` | 4-120 frames between spawns | 24 |
+| `size` | 5-40% of the frame the cutout aims to cover | 18% |
+| `pick` | coherent, dissimilar, random | coherent |
+| `min_motion` | 0-30%, ignore slower regions | 2% |
+| `max_motion` | 1-100%, ignore faster regions | 25% |
+| `similarity` | 0-100%, how close a surface must look to count as a match | 60% |
+| `shape` | blob, rect | blob |
+| `seam` | poisson, none | poisson |
+| `feather` | 0-100%, edge softness (scaled to the blob, not the frame) | 35% |
+| `hold` | 1-30 frames the cutout stays sharp | 6 |
+| `melt` | 2-60 frames it takes to dissolve | 14 |
+| `mode` | smudge, slide | smudge |
+| `retention` | 0-95%, how much smeared detail each melt frame keeps | 70% |
+| `drift` | 0-100%, how far the cutout follows its own motion | 100% |
+| `seed` | 0-2147483647, 0 derives repeatable timing from the clip | 0 |
+
+Selection is what makes or breaks the look, so it is worth knowing what the
+knobs do. Every spawn tiles the frame at analysis scale (longest side <= 160 px),
+rejects flat tiles, and measures two things per tile: how similar the surface is
+to the same spot a `gap` frames later, and how much the pixels actually differ
+there. A cutout is only eligible when the surface is similar (`similarity`) *and*
+the future really differs at that spot - borrowing from a region that looks
+identical ahead produces an invisible cutout, which is the old failure mode.
+`coherent` then prefers the strongest visible difference inside the motion window
+(`min_motion`..`max_motion`), `dissimilar` takes the least matching surface under
+a cap, and `random` is the unweighted baseline.
+
+The chosen seed tile grows into one blob by region growing on descriptor
+distance, relaxing the budget in passes and finally dilating so the area tracks
+`size`; morphology rounds it and a blob-scaled blur feathers the border. With
+`seam=poisson` and headless OpenCV the sharp hold frames are merged with
+`cv2.seamlessClone` (`NORMAL_CLONE`), otherwise a feathered alpha blend is used -
+`seam=none` gives exact future pixels with a hard-ish edge, which is what the
+provenance tests assert.
+
+`mode=smudge` keeps an accumulator per cutout, `acc = warp(acc, flow) * retention
++ future * (1 - retention)`, so melting detail is warped along the region's own
+motion and composited through the decaying mask; opacity eases out as the
+blotches open, otherwise the tail of the melt eats the live picture. `mode=slide`
+skips the accumulator and dissolves the mask with a low-frequency noise
+threshold, which is cheaper and reads as a clean dissolve rather than a smear.
+After `hold + melt` frames the cutout is gone and the emitted frame is the live
+frame, bit-identical.
+
+The future frames are real: the processor buffers `ceil(lookahead * fps) + 1`
+frames (at most 128, and never more than the 128 MiB budget) and emits every
+packet with its original index, timestamp and duration. A spawn is skipped when
+no real future frame exists at the gap distance (near the end of the clip), and
+the remainder is drained at EOF. Look-ahead is the only latency in the effect and
+it is dropped from the output timeline, not stretched. State resets on explicit
+or detected scene cuts, timestamp rewind and frame-index discontinuity, and is
+bounded independently of clip length.
+
+This effect is CPU-bound and needs NumPy (`requirements-stateful.txt`); poisson
+seams and DIS optical flow need headless OpenCV (`requirements-collapse.txt`),
+and without it the flow falls back to numpy block matching with a runtime note.
+It has no stateful preview; it does keep original rational timestamps because it
+uses the timestamped transport, so chaining with `inversion` preserves VFR input.
+Benchmark the processor alone with:
+
+```sh
+python3 tests/benchmark_futurecut.py --frames 90 --output benchmarks/futurecut.json
+```
+
+Processor-only timings on this Linux x86_64 host (fresh worker per case, 90
+frames, excludes FFmpeg decode/encode and is not an end-to-end claim):
+
+| mode | 640x360 mean / p95 | 1280x720 mean / p95 | 1920x1080 mean / p95 | peak state |
+| --- | --- | --- | --- | --- |
+| smudge | 6.02 / 15.75 ms | 22.54 / 80.75 ms | 36.45 / 69.50 ms | 122.6 MiB |
+| slide | 4.18 / 10.75 ms | 18.04 / 76.08 ms | 27.27 / 49.47 ms | 116.7 MiB |
+
+The p95 spikes are spawn frames (region growing plus the first smudge frame).
+Peak state is the buffered look-ahead plus one accumulator per live cutout, and
+the buffer is what limits resolution: the 128 MiB budget fits 18 frames at
+1080p and 8 at 1440p, so a long `lookahead` is clamped there with a runtime
+warning instead of growing without bound. End to end, a 2560x1440 clip renders
+at roughly 160 ms/frame including decode and encode.
 
 ## channel lobotomy
 
@@ -119,10 +332,11 @@ the original canvas dimensions. High-gradient regions resist shrinking.
 Analysis is capped at 192 pixels on the longest side and updates at most five
 times per second; the displacement field is smoothed between updates.
 `mode=elastic` keeps the earlier seeded, spatially nonuniform elastic warp.
-Both modes finish with a reduced-resolution pixel grid enlarged using nearest
-neighbors. Moving regions can borrow a limited blend of the previous frame's
-blocks for a codec-mosh-like trail; the effect does not modify codec packets or
-perform full datamoshing.
+Pixelation is a separate switch and is **off by default**: the render is the
+smooth warped frame at source resolution. Set `pixelate=on` to finish with a
+reduced-resolution grid enlarged using nearest neighbors, and optionally let
+moving regions borrow a limited blend of the previous frame's blocks for a
+codec-mosh-like trail. The effect never modifies codec packets.
 
 | option | range / values | default |
 | --- | --- | --- |
@@ -137,8 +351,9 @@ perform full datamoshing.
 | `speed` | 0-4 elastic cycles per second | 0.35 |
 | `coherence` | 0-100%, elapsed-time field smoothing | 80% |
 | `seed` | 0-2147483647; elastic mode only, 0 derives phases from the source | 0 |
-| `block_size` | 1-16 reduced-grid cells; larger means chunkier pixels | 4 |
-| `mosh` | 0-100%, motion-triggered previous-block carry (up to 50% mix) | 60% |
+| `pixelate` | on, off - finish with chunky pixel blocks | off |
+| `block_size` | 1-16 reduced-grid cells when `pixelate=on`; larger means chunkier | 4 |
+| `mosh` | 0-100%, previous-block carry when `pixelate=on` (up to 50% mix) | 60% |
 
 In seam mode, shrink is capped at 50% per axis. The target reduction is
 `50% × intensity × seam_strength × horizontal/vertical control`; `preserve`
@@ -148,41 +363,47 @@ at source dimensions. `smoothness` and `coherence` steady the reduced-resolution
 seam map; motion, speed, and random phases apply only to elastic mode.
 
 Zero intensity is an exact passthrough; two zero axis scales disable both modes.
+`block_size` and `mosh` do nothing while `pixelate=off`; the smooth remap is the
+default look.
 Zero seam strength disables seam mode. Seam geometry starts at identity and
-reaches its configured scale at clip end; the pixel-mosh texture applies from
-the first active frame.
-`block_size=1` with `mosh=0` disables the pixel-mosh texture.
+reaches its configured scale at clip end.
 State resets on a new input/shape, explicit reset, rewind, frame discontinuity,
 explicit scene cut, or a large RGB scene change. Persistent analysis state is
 bounded independently of clip length; full-frame remap buffers are transient.
 Chains such as `neon+collapse+sediment+deepfry` reuse the shared decoder,
 encoder, audio handling, progress, cancellation and partial-file cleanup.
 
-Benchmark both modes separately (requires the optional dependencies):
+Benchmark both modes, with and without pixelation (requires the optional
+dependencies):
 
 ```sh
-python3 tests/benchmark_collapse.py --frames 120 --output benchmarks/collapse.json
+python3 tests/benchmark_collapse.py --frames 60 --output benchmarks/collapse.json
+python3 tests/benchmark_collapse.py --frames 60 --pixelate on --output benchmarks/collapse-pixelated.json
 ```
 
 The report measures processor frame time and peak process RSS at 640x360 and
 1280x720 in fresh workers. It excludes FFmpeg decode/encode and is not an
 end-to-end playback guarantee. Seam mode also reports carving-update time.
 
-Recorded on this Linux x86_64 host with one OpenCV CPU thread, 120 frames per
+Recorded on this Linux x86_64 host with one OpenCV CPU thread, 60 frames per
 case, Python 3.13.5, NumPy 2.2.4 and OpenCV 4.12.0 (raw data in
-`benchmarks/collapse.json`):
+`benchmarks/collapse.json` and `benchmarks/collapse-pixelated.json`):
 
-| mode | frame size | mean ms/frame | p95 ms/frame | peak process RSS |
-| --- | --- | --- | --- | --- |
-| elastic | 640x360 | 5.44 | 6.25 | 64.4 MiB |
-| elastic | 1280x720 | 13.62 | 15.43 | 110.5 MiB |
-| seam | 640x360 | 22.62 | 117.82 | 63.5 MiB |
-| seam | 1280x720 | 32.13 | 127.87 | 108.1 MiB |
+| mode | pixelate | frame size | mean ms/frame | p95 ms/frame | peak process RSS |
+| --- | --- | --- | --- | --- | --- |
+| elastic | off | 640x360 | 4.41 | 4.55 | 64.5 MiB |
+| elastic | off | 1280x720 | 10.51 | 10.74 | 109.8 MiB |
+| seam | off | 640x360 | 16.71 | 89.15 | 63.6 MiB |
+| seam | off | 1280x720 | 26.34 | 114.34 | 110.2 MiB |
+| elastic | on | 640x360 | 4.53 | 4.63 | 64.9 MiB |
+| elastic | on | 1280x720 | 11.90 | 12.15 | 110.1 MiB |
+| seam | on | 640x360 | 22.30 | 122.10 | 63.4 MiB |
+| seam | on | 1280x720 | 28.22 | 114.30 | 110.2 MiB |
 
-Seam averages include frames reusing a cached map; carving-update frames alone
-averaged 116.51 ms at 360p and 127.58 ms at 720p. Persistent state was about
-0.38 MiB for elastic and 0.54 MiB for seam mode in these cases. These are
-measurements of this fixture on this host, not a promise for every input.
+Seam averages include frames reusing a cached map, so p95 is dominated by the
+carving update. Skipping pixelation removes the extra downsample/upsample pass
+(about 5 ms mean in seam mode here) and is the default. These are measurements
+of this fixture on this host, not a promise for every input.
 
 ## causality inversion
 
@@ -220,8 +441,14 @@ without keeping a look-ahead queue.
 Each inversion queue is capped at 128 frames and 128 MiB of persistent state.
 Transient RGB/float masks, alignment maps and encoder buffers are additional;
 the cap is not a limit on total process RSS.
-Impossible nominal-rate settings fail before decoding with a resize/lower-horizon
-hint. An unusually dense VFR burst can fill the queue; its oldest frame then
+High-resolution/high-rate inputs automatically shorten the effective look-ahead
+and offset to fit that budget, rather than refusing to render. The nominal limit
+is `(buffer capacity - 1) / fps`; requested settings are preserved. The completion
+screen, plain output and JSON `warnings` report any reduction. At 2560x1440/30 fps,
+the default 0.5-second request becomes about 0.367 seconds. Resize before inversion
+to retain a longer horizon. A frame larger than the entire budget still requires
+resizing; a one-frame capacity becomes passthrough with a warning.
+An unusually dense VFR burst can fill the queue; its oldest frame then
 uses the latest already-buffered future instead of exceeding the cap. Explicit
 reset, rewind, frame discontinuity or a new clip clears pending state. Scene
 cuts drain the old segment before starting the next, preventing future-scene
@@ -256,8 +483,10 @@ run the test suite with:
 ```sh
 python3 tests/run_tests.py
 python3 tests/run_tests.py psychedelic  # pixel behavior, options and real renders
+python3 tests/run_tests.py datamosh mosh-stream  # two sources, presets and codec clocks
 python3 tests/run_tests.py collapse seams  # deformation, carving and shared pipeline
 python3 tests/run_tests.py inversion  # future pixels, original PTS and EOF fallback
+python3 tests/run_tests.py archaeology archaeology-cli  # future-cut provenance and real renders
 ```
 
 tests use generated clips and temporary folders; they do not overwrite files in `input/` or `output/`.

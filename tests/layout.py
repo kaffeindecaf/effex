@@ -184,8 +184,44 @@ def main() -> int:
     if not require_tools(c):
         return 0
     scenario_sizes(c)
+    scenario_effect_options(c, "datamosh", 3, 0, "audio")
+    scenario_effect_options(c, "archaeology", 2, 5, "random seed")
     scenario_columns(c)
     return c.summary()
+
+
+def scenario_effect_options(c: Checker, effect: str, group: int,
+                            within_group: int, last_option: str) -> None:
+    from menu_smoke import DOWN, last_frame, next_effect_group, wait_last
+    for cols, height in ((36, 20), (60, 20), (80, 24)):
+        d = scenario_fit(c, cols, height)
+        d.send(b"p")
+        d.wait_for("pick a video")
+        d.send(ENTER)
+        d.wait_for("pick an effect")
+        next_effect_group(d, group)
+        if within_group:
+            d.send(DOWN * within_group)
+        d.send(ENTER)
+        d.wait_for(f"{effect} options")
+        frame = last_frame(d).split("\033[J")[0].rstrip()
+        c.check(f"{cols}x{height}: {effect} options fit vertically",
+                len(frame.splitlines()) < height, str(len(frame.splitlines())))
+        check_frame(c, f"{cols}x{height} {effect}", frame, cols)
+        reached = False
+        from menu_smoke import press_and_wait
+        for _ in range(40):
+            press_and_wait(d, DOWN)
+            if last_option in last_frame(d):
+                reached = True
+                break
+        frame = last_frame(d).split("\033[J")[0].rstrip()
+        c.check(f"{cols}x{height}: bottom {last_option} option stays reachable",
+                reached and len(frame.splitlines()) < height)
+        for _ in range(4):
+            d.send(b"q")
+        c.check(f"{cols}x{height}: {effect} clean exit", d.expect_exit(6) == 0)
+        d.close()
 
 
 if __name__ == "__main__":

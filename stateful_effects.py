@@ -297,7 +297,7 @@ class ElasticCollapse:
         "intensity": 100, "horizontal": 100, "vertical": 100, "preserve": 75,
         "mode": "seam", "seam_strength": 100, "motion": 50,
         "smoothness": 70, "speed": 0.35, "coherence": 80, "seed": 0,
-        "block_size": 4, "mosh": 60,
+        "pixelate": False, "block_size": 4, "mosh": 60,
     }
 
     def __init__(self):
@@ -331,6 +331,20 @@ class ElasticCollapse:
             return default
         return max(low, min(high, number)) if math.isfinite(number) else default
 
+    @staticmethod
+    def _flag(value, default: bool) -> bool:
+        """Accept bools, 0/1 and on/off-style strings from the CLI and menu."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("on", "yes", "true", "1", "y"):
+            return True
+        if text in ("off", "no", "false", "0", "n"):
+            return False
+        return default
+
     def initialize(self, config: dict, frame_shape: tuple, fps: float,
                    seed: int) -> None:
         try:
@@ -353,6 +367,8 @@ class ElasticCollapse:
                 if mode not in ("elastic", "seam"):
                     raise ValueError("collapse mode must be elastic or seam")
                 self._config[key] = mode
+            elif key == "pixelate":
+                self._config[key] = self._flag(config.get(key, default), default)
             else:
                 high = 4.0 if key == "speed" else (2147483647 if key == "seed" else 100)
                 if key == "block_size":
@@ -551,6 +567,9 @@ class ElasticCollapse:
         map_y += np.arange(height, dtype=np.float32)[:, None]
         warped = cv.remap(frame, map_x, map_y, interpolation=cv.INTER_LINEAR,
                           borderMode=cv.BORDER_REFLECT_101)
+        if not self._config["pixelate"]:
+            self._previous_mosh_grid = None
+            return warped
         return self._pixel_mosh(warped, motion_delta)
 
 
@@ -578,6 +597,9 @@ class CausalityInversion:
         self._scene_sample: Any = None
         self._coverage: Any = None
         self.capacity_fallbacks = 0
+        self.effective_lookahead = 0.0
+        self.effective_offset = 0.0
+        self.runtime_notes = []
 
     def initialize(self, config: dict, frame_shape: tuple, fps: float, seed: int) -> None:
         try:
@@ -617,12 +639,20 @@ class CausalityInversion:
         self._capacity = min(self.MAX_FRAMES, (self.MAX_STATE_BYTES - 65536) // frame_bytes)
         delay = self._config["lookahead"] if self._config["strength"] and self._config["offset"] else 0
         rate = ElasticCollapse._number(fps, 30.0, 0.001, 1000)
-        needed = math.ceil(delay * rate) + 1
-        if needed > self._capacity:
+        if self._capacity < 1:
             raise ValueError(
-                f"inversion lookahead needs {needed} frames but the 128 MiB/128-frame "
-                f"budget fits {self._capacity}; lower lookahead or resize before inversion"
+                "inversion cannot fit one RGB frame in its 128 MiB buffer budget; "
+                "resize before inversion"
             )
+        self.effective_lookahead = min(delay, (self._capacity - 1) / rate)
+        self.effective_offset = min(self._config["offset"], self.effective_lookahead)
+        self.runtime_notes = []
+        if self.effective_lookahead + 1e-9 < delay:
+            self.runtime_notes.append(
+                f"inversion buffer budget limits look-ahead to {self.effective_lookahead:.3f}s "
+                f"and future offset to {self.effective_offset:.3f}s "
+                f"at {self._shape[1]}x{self._shape[0]} / {rate:g} fps; "
+                "resize before inversion for a longer horizon")
         self.reset()
 
     @property
@@ -717,7 +747,7 @@ class CausalityInversion:
 
     def _emit_oldest(self):
         current = self._queue.popleft()
-        target = float(current.timestamp) + self._config["offset"]
+        target = float(current.timestamp) + self.effective_offset
         future = next((p for p in self._queue if float(p.timestamp) + 1e-9 >= target),
                       self._queue[-1] if self._queue else current)
         return self._mix(current, future)
@@ -744,14 +774,14 @@ class CausalityInversion:
         self._scene_sample = sample
         self._next_index = packet.index + 1
         self._last_timestamp = stamp
-        if self._config["strength"] == 0 or self._config["offset"] == 0:
+        if self._config["strength"] == 0 or self.effective_offset == 0:
             yield replace(packet, frame=packet.frame.copy())
             return
         while len(self._queue) >= self._capacity:
             self.capacity_fallbacks += 1
             yield self._emit_oldest()
         self._queue.append(replace(packet, frame=packet.frame.copy()))
-        while self._queue and stamp - float(self._queue[0].timestamp) + 1e-9 >= self._config["lookahead"]:
+        while self._queue and stamp - float(self._queue[0].timestamp) + 1e-9 >= self.effective_lookahead:
             yield self._emit_oldest()
 
     def flush(self):

@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 
-def worker(mode, width, height, frames):
+def worker(mode, width, height, frames, pixelate=False):
     import cv2
     import numpy as np
     from stateful_effects import ElasticCollapse
@@ -32,7 +32,8 @@ def worker(mode, width, height, frames):
                       ((x // 20 + y // 20) % 2) * 255), axis=-1).astype(np.uint8)
     del x, y
     processor = ElasticCollapse()
-    config = dict(ElasticCollapse.DEFAULTS, mode=mode, seed=17)
+    config = dict(ElasticCollapse.DEFAULTS, mode=mode, seed=17,
+                  pixelate=pixelate)
     processor.initialize(config, frame.shape, 30.0, 17)
     times, update_times = [], []
     # Warm up libraries, then reset so measured frame zero includes first setup.
@@ -49,7 +50,8 @@ def worker(mode, width, height, frames):
         if processor.seam_updates != updates:
             update_times.append(elapsed)
     return {
-        "mode": mode, "width": width, "height": height, "frames": frames,
+        "mode": mode, "pixelate": pixelate,
+        "width": width, "height": height, "frames": frames,
         "config": config, "mean_ms": float(np.mean(times)),
         "p50_ms": float(np.percentile(times, 50)),
         "p95_ms": float(np.percentile(times, 95)), "max_ms": max(times),
@@ -69,30 +71,37 @@ def main():
     parser.add_argument("--frames", type=int, default=120)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker", choices=("elastic", "seam"))
+    parser.add_argument("--pixelate", choices=("off", "on"), default="off",
+                        help="benchmark the opt-in pixel grid (default: off, the effect default)")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=360)
     args = parser.parse_args()
     if args.frames < 1:
         parser.error("--frames must be positive")
     if args.worker:
-        print(json.dumps(worker(args.worker, args.width, args.height, args.frames)))
+        print(json.dumps(worker(args.worker, args.width, args.height, args.frames,
+                                pixelate=args.pixelate == "on")))
         return
+    pixelate = args.pixelate == "on"
     rows = []
     for mode in ("elastic", "seam"):
         for width, height in ((640, 360), (1280, 720)):
             proc = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), "--worker", mode,
-                 "--width", str(width), "--height", str(height), "--frames", str(args.frames)],
+                 "--width", str(width), "--height", str(height), "--frames", str(args.frames),
+                 "--pixelate", args.pixelate],
                 capture_output=True, text=True, check=True, cwd=REPO,
             )
             row = json.loads(proc.stdout)
             rows.append(row)
-            print(f"{mode:7} {width}x{height}: {row['mean_ms']:.2f} ms mean, "
+            print(f"{mode:7} pixelate={args.pixelate:3} {width}x{height}: "
+                  f"{row['mean_ms']:.2f} ms mean, "
                   f"{row['p95_ms']:.2f} ms p95, {row['peak_rss_mib']:.1f} MiB peak RSS")
     assert len(rows) == 4
     report = {
         "recorded_utc": datetime.now(timezone.utc).isoformat(),
         "platform": platform.platform(), "logical_cpus": os.cpu_count(),
+        "pixelate": pixelate,
         "scope": "synthetic moving RGB; process() only; fresh process per mode/size; not end-to-end render FPS",
         "results": rows,
     }

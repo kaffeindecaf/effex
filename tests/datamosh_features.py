@@ -65,6 +65,50 @@ def main() -> int:
         env = {"EFFEX_INPUT_DIR": str(in_dir),
                "EFFEX_OUTPUT_DIR": str(out_dir), "NO_COLOR": "1"}
 
+        proc = run([EFFEX, "datamosh", first, "--with", str(second),
+                    "--json"], env_extra=env)
+        c.check("--with joins two clips using the heavy preset by default",
+                proc.returncode == 0, proc.stderr.decode()[:300])
+        if proc.returncode == 0:
+            heavy = json.loads(proc.stdout.decode())
+            c.check("JSON reports the actual tuned heavy settings",
+                    heavy["options"]["preset"] == "heavy" and
+                    heavy["options"]["bloom"] == 12 and
+                    heavy["options"]["grit"] == 18)
+            output = Path(heavy["output"])
+            video = next(s for s in ffprobe_streams(output)["streams"]
+                         if s["codec_type"] == "video")
+            c.check("heavy two-clip blooming preserves all frame slots",
+                    int(video["nb_frames"]) == 20)
+            decode = run(["ffmpeg", "-v", "error", "-i", str(output),
+                          "-an", "-f", "null", "-"])
+            c.check("heavy output decodes without damaged-header errors",
+                    decode.returncode == 0 and not decode.stderr,
+                    decode.stderr.decode()[:300])
+            proc = run([EFFEX, "datamosh", first, "--with", str(second),
+                        "--set", "preset=standard", "--json"], env_extra=env)
+            c.check("standard preset remains available for the old look",
+                    proc.returncode == 0, proc.stderr.decode()[:300])
+            if proc.returncode == 0:
+                standard = json.loads(proc.stdout.decode())
+                c.check("heavy changes decoded pixels, not just metadata",
+                        frame_rgb_mean(Path(heavy["output"]), "1.7") !=
+                        frame_rgb_mean(Path(standard["output"]), "1.7"))
+
+        proc = run([EFFEX, "pixelize", first, "--with", str(second),
+                    "--dry-run"], env_extra=env)
+        c.check("--with is explicitly datamosh-only", proc.returncode == 2
+                and b"datamosh" in proc.stderr)
+        proc = run([EFFEX, "datamosh", first, "--with", str(second),
+                    "--set", "second=other.mp4", "--dry-run"], env_extra=env)
+        c.check("conflicting secondary inputs are not silently ignored",
+                proc.returncode == 2 and b"conflict" in proc.stderr)
+        for setting in ("bloom=0", "bloom=61", "bloom_window=0",
+                        "bloom_window=13", "preset=unknown"):
+            proc = run([EFFEX, "datamosh", first, "--set", setting,
+                        "--dry-run"], env_extra=env)
+            c.check(f"invalid {setting} is rejected", proc.returncode == 2)
+
         proc = run([EFFEX, "datamosh", first, "--set", "second=motion.mp4",
                     "--set", "hold=4", "--json"], env_extra=env)
         c.check("a second video joins the datamosh stream",

@@ -2,12 +2,14 @@
 
 purpose: pick one item per session, finish it end-to-end (code + test + docs),
 then check it off with a done note saying what actually landed.
-format: `[ ]` open, `[x]` done, done notes indented under the item.
+format: `[ ]` open, `[~]` half done (ships but the look is not right yet),
+`[x]` done, notes indented under the item.
 state: input/ holds source videos, output/ holds renders and previews, effex.py
-is the tool (v0.12.0, 24 effects, chains of two or more), tests/ has ten
+is the tool (v0.14.0, 25 effects, chains of two or more), tests/ has thirteen
 suites. verify before closing an item with:
 
-    python3 tests/run_tests.py        # cli + datamosh + menu + layout + install + stateful + psychedelic + collapse + seams + inversion
+    python3 tests/run_tests.py        # cli + datamosh + mosh-stream + menu + layout + install + stateful + psychedelic + collapse + seams + inversion + archaeology + archaeology-cli
+    python3 tests/benchmark_futurecut.py --frames 90 --output benchmarks/futurecut.json
     python3 tests/make_clip.py        # drop a lavfi test clip into input/
     ./install.sh                      # effex onto ~/.local/bin
 
@@ -246,17 +248,43 @@ expressions, so they are drop-in once the effect model supports the bits they ne
   validate the second source and segment bounds before encoding; ffprobe-backed
   tests verify duration, frame size, cross-source motion, audio and keyframe
   survival._
+  _Heavy preset: defaults to grit 18, 12-frame GOP, chaos fill and 12-slot
+  prediction blooms cycling two motion frames. Standard restores the previous
+  knobs. Bloom replaces slots, retaining destination VOP clocks; incompatible
+  header lengths retain the original slot to protect byte-aligned slices.
+  `--with` joins two sources without changing positional batch semantics.
+  The menu loads either preset and scrolls codec options on short terminals.
+  Tests cover actual decoded pixel changes, full frame counts, clock rollovers,
+  fractional frame rates, audio and both CLI/menu paths. Research below._
 - [x] E2.26 - circuit bending kit
   _Done 2026-09-24: channelswap (colorchannelmixer channel rewrites plus
-  optional chroma bleed), blockswap (swaprect blocks traveling on sin
-  curves) and dropout (bendr-style random frame drops with freeze-holds,
-  audio untouched). two real ffmpeg-7 gotchas surfaced: lutrgb has no
+  optional chroma bleed), blockswap (swaprect blocks trading places),
+  and dropout (bendr-style random frame drops with freeze-holds, audio
+  untouched). two real ffmpeg-7 gotchas surfaced: lutrgb has no
   cross-channel variables (r=b is undefined - colorchannelmixer is the
   swap filter), and swaprect's expression context knows w/h but not iw/ih.
   behavioral proofs: a pure red frame comes out pure blue after a rb swap,
-  and frames at two timestamps differ on a static clip, so the blocks
-  really travel. the bendr / video-glitch-array vocabulary from section 6
-  fed this._
+  and the relocated blocks are visible against the source frame. the bendr /
+  video-glitch-array vocabulary from section 6 fed this._
+  _Changed 2026-10-25 by request: blockswap blocks no longer travel on sin
+  curves. Positions are chosen once from a seed, each pair swaps a fixed
+  rectangle for the whole clip, `blocks` selects how many pairs (1-8) and
+  `seed` makes the layout reproducible. Pairs are kept from overlapping
+  unless the frame is too crowded. The old `speed` knob is gone; `blocks`
+  replaced it. A static-frame test proves the output does not drift beyond
+  codec noise, and a regex check proves a `blocks=N` render emits N swaprects
+  with no time expression._
+  _Extended 2026-10-25: `teleport` (0-30s, default 3) emits one seeded layout
+  per window with `enable='between(t,...)'`/`gte(t,...)`, capped at 48/blocks
+  windows; `mosh` (0-100%, default 0) adds a light codec pass - mpeg4 at
+  `mosh_grit`/`mosh_hold`, dice keyframe survival of `100 - mosh`, motion bloom
+  of `mosh/12` slots, then a remux with the source audio. Teleports become real
+  prediction breaks, so the blocks themselves smear. blockswap is therefore a
+  multi-pass effect (no chaining, no preview) but still single-pass libx264 when
+  `mosh=0`. dry-run now prints the resolved filter chain and plan notes for
+  every multi-pass effect. Tests cover window counts, per-window layouts, the
+  codec output, frame/audio preservation and the mosh-vs-plain pixel delta;
+  the menu test covers the new rows and the hidden preview key._
 - [x] E2.27 - crunch (bitrate + resolution down)
   _Done 2026-09-24: resolution choice (keep/75/50/25%) and a bitrate cap
   (100-5000 kbit/s). forced a small engine flag: Plan.abr drops -crf for
@@ -393,11 +421,211 @@ Shared rules for the stateful effects:
   preservation, optional dependencies and TUI/CLI integration. Optional headless
   OpenCV remains isolated in requirements-collapse.txt. Existing stateful VFR
   normalization, adjacent-processor and preview limits remain explicit._
-- [ ] E2.47 - pixel archaeology (prompt effect 09): transplant patches from earlier frames using content matching.
-  - Keep a bounded reservoir of old frames or patches. Cache inexpensive descriptors such as color mean/variance, gradient histograms, or downsampled pixels; sample candidates instead of searching every patch in every frame.
-  - Match current regions to historical patches by color, texture, or edge compatibility. Include a controlled mismatch mode. Support hard copy and soft/feathered boundaries; every replacement must come from actual video history, not random rectangles.
-  - Options: history capacity/seconds, patch size, candidates per frame, analysis interval, match metric/threshold, mismatch strength, replacement chance, boundary mode, displacement, seed.
-  - Test patch provenance, distinct matching modes, zero-intensity passthrough, deterministic selection, and bounded history memory.
+  _Pixelation split out 2026-10-25: `pixelate` is a bool and defaults to off, so
+  the shipped look is the smooth content-aware warp at source resolution.
+  `block_size`/`mosh` only act when `pixelate=on`. CLI and menu both toggle it
+  (`--set pixelate=on`, enter on the row); default-off output is proven
+  non-blocky by a run-length check, and block knobs are proven inert while off.
+  Benchmarks record both settings._
+- [~] E2.47 - pixel archaeology: transplant real cutouts from other moments in the clip into the present frame, then mosh them back in.
+  - Original prompt: keep a bounded reservoir of old frames/patches, cache cheap descriptors, sample candidates instead of exhaustive search, match by color/texture/edge, support mismatch and hard/soft boundaries, every replacement from real video.
+  - Options: history capacity/seconds, patch size, candidates, interval, metric/threshold, mismatch, chance, boundary, displacement, seed.
+  _Partial 2026-10-25: `archaeology` ships a bounded, time-expiring reservoir of
+  earlier source tiles with cached color/texture/edge descriptors, sampled
+  candidates, mismatch chance, hard/soft edges, resolution-independent auto
+  tiles, deterministic seeds, bounded memory and full CLI/menu/chain wiring
+  (19 processor + 3 media-cli + 9 menu + 24 layout checks, benchmark in
+  benchmarks/archaeology.json). Provenance is exact: hard tiles are byte-equal
+  copies of stored source patches._
+  _Why it is only half done: the output is a uniform tile grid of unrelated
+  scraps, so it reads as random pixel noise, not as art. There is no coherent
+  subject, no temporal story and no blend: a tile appears and is simply gone next
+  frame. Nothing is borrowed from the future, and nothing is moshed. The user's
+  reference is a sky of clouds where a cutout of a *future* cloud drifts into the
+  present frame and then melts back into the picture. Everything below replaces
+  the tile-scatter behaviour; treat the current look as a placeholder, not the
+  goal._
+  _Phase A shipped 2026-10-26 and replaced the tile version outright:
+  `future_cut.py` (`FutureCut`, timestamped push/flush) is now the only
+  archaeology processor, `pixel_archaeology.py` and its tests are deleted, and
+  the effect key, menu entry and chain rules are unchanged. It buffers
+  `lookahead` seconds (clamped to the 128 MiB budget - 18 frames at 1080p, 11 of
+  look-ahead at 1080p60 with three cutouts - and surfaced as a runtime warning), picks a tile where the future surface is similar *and* the
+  pixels actually differ (identical-ahead regions give invisible cutouts - the
+  old failure mode), grows it into one blurred blob, composites with
+  `cv2.seamlessClone` during hold, and melts it with a flow-warped smudge
+  accumulator or a coarse-noise dissolve, then hands back the live frame
+  bit-identically. `18` processor tests (provenance from frame `+gap`, one
+  coherent blob, area tracks `size`, no-identical-pick, residue, determinism,
+  resets/scene cuts, budget clamp, no-cv2 fallback, metadata) plus
+  `tests/archaeology_integration.py` (registry, CLI render, dry-run notes, bad
+  choices, chains with FFmpeg effects and with inversion, VFR PTS preservation).
+  Benchmarks in `benchmarks/futurecut.json`. Still `[~]`: the look has not been
+  accepted by the user, `mode=codec` (a real bitstream mosh-out instead of the
+  smudge accumulator) is deferred until chains can own multi-pass pipelines
+  (E3.16), and E2.48 anti-motion compensation is unbuilt._
+
+#### E2.47a - future-cut compositor (the look: a coherent slab from the future)
+
+Target shot, stated as the acceptance image: a slow sky of clouds, 720p+. At
+frame N a 10-25% region of the sky is replaced by a cloud that is genuinely from
+frame N+K (0.2-1.0s later), offset a little and continuing the same drift. For
+roughly 6-12 frames it slides with the scene as one coherent shape. Then it
+smears along its own motion and dissolves in blotches back into the live sky, so
+no rectangle edge and no cut line is ever visible for more than a frame or two.
+The subject (horizon, buildings, a person) is never cut or displaced.
+
+- Reuse the buffer, do not duplicate it: factor the bounded look-ahead in
+  `stateful_effects.CausalityInversion` into a shared `FutureBuffer` (same
+  128 frames / 128 MiB budget, same rational-PTS queue, same scene-cut drain).
+  `inversion` and this effect both consume it, so one timestamped transport path
+  stays in charge. Frame gap in frames, converted from seconds via probed fps.
+- Analysis resolution: longest side <= 256 px for flow and scoring, full
+  resolution only for the final cutout pixels. OpenCV DIS optical flow
+  (`cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)`) present frame
+  -> future frame; Farneback fallback; without OpenCV, degrade to descriptor
+  search only and say so in the plan notes (quality drop, no silent failure).
+- Region proposal (the part that makes it look intentional, not noisy):
+  1. score overlapping tiles (32-96 px at analysis scale) on three signals:
+     descriptor similarity between the present tile and the future tile warped
+     back by flow, flow magnitude within `min_motion..max_motion`, and warp
+     residual (does the future tile actually continue this texture?).
+  2. reject flat tiles: gradient energy below a floor (blank sky corner, wall)
+     never becomes a cutout.
+  3. grow the best seed tile into one blob by region growing on descriptor
+     distance, then morphology open/close, then blur the mask for a soft edge.
+     Keep exactly one dominant blob per spawn, sized 5-25% of the frame; a
+     second blob only when `cutouts=2+`.
+  4. `pick=coherent` (default) prefers similar-but-shifted content;
+     `pick=dissimilar` prefers the largest descriptor distance under a cap for a
+     harder, wrong-content look; `pick=random` is the debug/baseline mode.
+- Compositing: mask-shaped cutout (never an axis-aligned rectangle), feathered
+  8-20 px, optional Poisson blend via `cv2.seamlessClone(..., NORMAL_CLONE)`
+  when `seam=poisson`; `MIXED_CLONE` only for the mismatch look. The cutout
+  keeps an anchor tracked by flow each frame so it drifts with the scene instead
+  of sticking to screen space.
+- Lifecycle per spawn: `spawn_every` frames, at most `cutouts` alive, each with
+  `age`, `hold` (sharp frames) and `melt` (dissolve frames). Spawning is seeded,
+  so the same clip and seed give the same render.
+
+#### E2.47b - mosh-out: dissolving the cutout back into the video
+
+The cutout must not fade like an opacity slider; it has to look like prediction
+smear. Three modes, `mode=smudge` as default:
+
+- `slide`: paste live future pixels for `hold` frames, then a spatially
+  irregular alpha ramp (threshold noise, not a linear fade) back to the live
+  frame. Cheapest, most controllable, least "codec".
+- `smudge` (default): keep a feedback accumulator per cutout. Each frame
+  `acc = warp(acc, local flow) * retention + live_future * (1 - retention)`,
+  then composite `acc` through the decaying mask. Content streaks along its own
+  motion and dissolves in blotches, which is what the eye reads as motion-vector
+  smearing, without touching the bitstream.
+- `codec` (multi-pass, like datamosh): render the clip normally, then re-encode
+  the spawn..melt window with the existing mpeg4 bloom pass (`strip_ivops` with
+  `bloom`), so decoder prediction really does drag the pasted region forward,
+  then concat the untouched head/tail. This is the honest datamosh version; it
+  is allowed to be a separate multi-pass effect (cannot chain), and the roadmap
+  E3.16 shape is the prerequisite for doing it inside a chain.
+- Dissolve shape: mask erosion from the edges inward combined with a noise
+  threshold so it goes in blotches, plus a 1-2 px flow-aligned smear on the
+  boundary. Kill the mask completely by `melt` frames, always.
+- Never leave residue: after `hold+melt` frames the accumulated mask contribution
+  must be exactly zero, so a still frame later in the clip is bit-identical to
+  the un-effected one.
+
+#### E2.47c - options (planned names, ranges, defaults)
+
+| key | range / values | default | meaning |
+| --- | --- | --- | --- |
+| `lookahead` | 0.1-2.0 s | 0.6 | how far into the future the cutout may come from |
+| `gap` | 1-60 frames | 18 | preferred distance to the donor frame |
+| `cutouts` | 1-3 | 1 | simultaneous live cutouts |
+| `spawn_every` | 4-120 frames | 24 | how often a new cutout is born |
+| `size` | 5-40% | 18% | cutout area as a share of the frame |
+| `pick` | coherent, dissimilar, random | coherent | region choice policy |
+| `min_motion` | 0-30% of frame | 2% | ignore near-static regions |
+| `max_motion` | 1-100% of frame | 25% | ignore content that teleports |
+| `similarity` | 0-100% | 60% | descriptor acceptance threshold |
+| `shape` | blob, rect | blob | mask growth or a plain rectangle |
+| `seam` | none, poisson | poisson | boundary blend |
+| `feather` | 0-100% | 35% | mask edge softness |
+| `hold` | 1-30 frames | 6 | sharp frames before the mosh starts |
+| `melt` | 2-60 frames | 14 | dissolve length |
+| `mode` | slide, smudge, codec | smudge | how it leaves |
+| `retention` | 0-95% | 70% | smudge feedback carry |
+| `drift` | 0-100% | 100% | how strongly the cutout follows flow |
+| `seed` | 0-2147483647 | 0 | deterministic spawn/choice |
+
+#### E2.47d - tests and acceptance gates
+
+- Synthetic fixtures, generated in NumPy so they are deterministic: (1) two
+  textures translating at different speeds (the cloud case), (2) a static
+  gradient with one moving object, (3) a hard scene cut mid-clip, (4) a clip
+  shorter than `lookahead+gap` frames.
+- Provenance: every pixel inside the final mask at spawn time must be traceable
+  to a donor frame at or after `gap` frames ahead (compare against the buffered
+  source, tolerance 0 for `seam=none`).
+- Coherence, the current failure: count connected components of changed pixels
+  per frame (must be 1-3, not hundreds) and require the largest component to
+  cover >= 60% of changed area. This is the specific regression that stops it
+  from being pixel noise again.
+- Edge quality: mean gradient discontinuity across the mask boundary must stay
+  under a threshold vs the same boundary in the source, for `feather>0`.
+- Lifecycle: mask contribution is zero after `hold+melt`; a frame 2s later is
+  unchanged; two renders with the same seed match bit-for-bit; a different seed
+  differs.
+- Transport: chained with `inversion`, video PTS/frame count survive exactly
+  (ffprobe, not duration only); audio is preserved or deliberately absent.
+- Resets: scene cut, rewind, index discontinuity, EOF (near the end there is no
+  future: fall back to the last buffered frame, then stop spawning).
+- Manual gate before closing: 720p contact sheet with before/spawn/hold/mid-melt/
+  after frames, plus a 6s side-by-side against the source. If it still reads as
+  noise, it is not done.
+- Budget: processor-only <= 15 ms/frame at 720p target; benchmark script
+  `tests/benchmark_futurecut.py` in fresh workers, reporting analysis cost
+  separately from compositing.
+
+#### E2.47e - would training a model with PyTorch help? decision: no training, optional pretrained inference
+
+Short answer: do not train anything. Train only if a problem cannot be solved
+with correspondence, and this is a correspondence problem, not a classification
+problem.
+
+- Why training is the wrong tool here: the effect needs "which region of *this*
+  clip, K frames later, continues *this* texture", which is per-clip and
+  self-supervised by the clip itself. There is no dataset of "present frame ->
+  desirable future cutout"; labelling one is exactly the artistic decision the
+  effect is making. A trained model would learn one clip family's look and would
+  need GPU training, checkpoints and a much heavier dependency tree than the
+  repo's NumPy/OpenCV optional-dependency policy allows.
+- What actually solves it, in order: DIS/Farneback flow for correspondence,
+  descriptor matching for "same kind of surface", region growing for a coherent
+  blob, Poisson blending for the seam. All deterministic, CPU, and debuggable -
+  important because the failure mode we just shipped (tile noise) is a *selection*
+  bug, and selection is inspectable when it is classical.
+- Where pretrained models genuinely help, inference only, no training:
+  - `metric=learned`: DINOv2 patch features (small ViT, exported to ONNX) give
+    far better "same texture, different phase" matching than RGB mean/std, which
+    matters for clouds, water and foliage whose local colour is nearly constant.
+    Ship behind `requirements-learned.txt` (onnxruntime only), degrade to
+    `metric=color` when absent.
+  - `shape=semantic`: SAM 2 (or a light ADE20K segmenter) to constrain cutouts to
+    a class mask - sky, water, skin, fabric - so a cutout can never paste half a
+    building into the sky. SAM 2 is promptable and video-aware
+    (github.com/facebookresearch/sam2); it is also the heaviest dependency in
+    this roadmap, so it belongs in an opt-in phase, never the default path.
+- Phasing: A) classical flow + descriptors + smudge (no ML, the default shipping
+  path); B) optional ONNX DINOv2 descriptor; C) optional SAM 2 semantic masks.
+  Re-evaluate after A looks right; if A already reads as intended, stop there.
+- If the look still fails after A, the next lever is not training but better
+  temporal reasoning: multi-frame flow voting (use 3 donor frames, keep the
+  region whose motion is most consistent) and 2-3 candidate regions per spawn
+  scored by a hand-written "looks like a cloud" term (gradient entropy, no
+  straight edges, similar local statistics).
+
+### stateful glitch effects (continued)
+
 - [ ] E2.48 - anti-motion compensation (prompt effect 15): estimate motion, then amplify it instead of stabilizing it.
   - Reuse a shared flow field if the pipeline can safely provide one; otherwise estimate dense flow from previous/current grayscale frames at a configurable analysis resolution, starting with Farneback flow if OpenCV is accepted. Smooth and clamp vectors, apply a tunable gain, and remap the current frame. Verify the displacement sign with a synthetic moving shape before tuning the look.
   - Options: flow gain, nonlinear gain, motion threshold, analysis resolution, smoothing, max displacement, optional trail amount/decay, seed for randomized modulation.
@@ -410,7 +638,7 @@ Shared rules for the stateful effects:
   _Done: `inversion` adds bounded look-ahead with separate blend, replacement,
   band-tearing and CPU-flow-aligned modes. Region masks, speed, feathering,
   strength, horizon/offset, alignment and seed are configurable. Queues cap at
-  128 frames/128 MiB, reject impossible nominal settings and clamp dense VFR
+  128 frames/128 MiB, adapt nominal look-ahead to fit and clamp dense VFR
   bursts/EOF/cuts to available future content. Streaming stages retain rational
   PTS and dimensions through optional PyAV/NUT transport inside the existing
   FFmpeg render lifecycle; compatible unfiltered audio is copied. Tests verify
@@ -419,6 +647,11 @@ Shared rules for the stateful effects:
   writes, failure/cancel cleanup and the menu. Separate 360p/720p benchmarks for
   all four modes are saved in benchmarks/inversion.json. README documents
   buffering latency, live-input limits, fallback and optional dependencies._
+  _High-resolution fix: defaults now render at native resolution by shortening
+  the effective horizon/offset to the memory budget, with a visible/JSON warning.
+  Plain launches use the local project environment when available, and the done
+  screen retains actual dependency/encoder errors. Requested settings and exact
+  video timestamps remain unchanged. Regression coverage includes 1440p output._
 
 ---
 
@@ -441,7 +674,7 @@ Shared rules for the stateful effects:
   and pixelize's "keep" branch reads the working frame instead of the clip), so
   stretch+pixelize pixelates the stretched 1080x1920 frame and not the 640x360
   source. options are keyed per effect: --set key=value still works while one
-  effect in the chain has that key, two effects sharing one (zoom and blockswap
+  effect in the chain has that key, two effects sharing one (zoom and wobble
   both take speed) is refused with both qualified forms named, --set
   effect.key=value always works, and --size lands on the first effect with a
   shape option. menu: space chips a row, the chip number is the run order, c
@@ -562,9 +795,9 @@ feasibility noted so nobody spends a week on them by accident.
 - datamosh extras now shipped: configurable dice survival (0-100%) and
   explicit deterministic seed; append a second video into the same mpeg4
   motion stream with start/length trims and auto-concatenated audio. The menu
-  selects the second input, the CLI accepts `--set second=path`, and source
-  formats are normalized before encoding. still on the table: motion-vector
-  transplants (ffglitch) and bloom/stutter p-vop duplication. note: "no
+  selects the second input, the CLI accepts `--with path` or `--set second=path`,
+  and source formats are normalized before encoding. Heavy motion blooming
+  now ships; still on the table: motion-vector transplants (ffglitch). note: "no
   keyframes at all" was tried and removed - an mpeg4 stream without its
   first i-vop decodes to zero video frames, so total mode cannot ship.
   section 6 has the sources.
@@ -594,6 +827,12 @@ item it feeds. links were live at the time of writing.
 
 ### datamosh (landed as E2.25 - these shaped it)
 
+- https://github.com/GlitchTools/tomato - bloom repeats one prediction frame;
+  pulse repeats groups periodically. Informs the heavy preset's burst/window
+  controls, but Effex replaces existing slots to avoid stretching the audio.
+- https://github.com/rjmoggach/python-moshion - joins outgoing and incoming
+  sequences before keyframe removal, transferring motion across their boundary.
+  Informs the two-source workflow; no external code is vendored.
 - https://github.com/ramiropolla/ffglitch-core - THE tool: an ffmpeg fork that
   lets scripts read and rewrite motion vectors and dct blocks mid-decode
   (ffedit/ffgac). the gold standard; build-heavy, do not vendor.
@@ -614,6 +853,35 @@ item it feeds. links were live at the time of writing.
 - https://github.com/diegochavez-io/datamosh-tools - three methods (avi,
   h264 nal, ffglitch) plus pixelmosh.py with 23 pixel effects (tear, chanshift,
   pixsort, dropout, melt, ghost...) - a catalogue of effect ideas by itself.
+
+### future-cut compositing (feeds E2.47a-E2.47e)
+
+- https://docs.opencv.org/4.x/df/da0/group__photo__clone.html - cv.seamlessClone
+  and the Poisson solvers (NORMAL_CLONE / MIXED_CLONE). This is the seam tool:
+  normal clone keeps the pasted cutout's own lighting, mixed clone grafts the
+  destination structure, which is what a mismatched cloud wants.
+- https://gfx.cs.princeton.edu/pubs/Barnes_2009_PAR/index.php - PatchMatch:
+  randomized approximate nearest-neighbour patch search. The reference for
+  matching a present tile against many future candidates without an exhaustive
+  search; the region-growing scorer in E2.47a is a cheap descendant of this idea.
+- https://docs.opencv.org/4.10.0/de/d4f/classcv_1_1DISOpticalFlow.html - DIS dense
+  inverse-search flow, three presets, fast enough for per-frame analysis at
+  <=256px. Preferred over Farneback for the present->future gap because a 0.2-1s
+  jump is large motion.
+- https://github.com/facebookresearch/sam2 - SAM 2 promptable video
+  segmentation. Optional `shape=semantic` phase only: constrain cutouts to sky /
+  water / skin so a transplant cannot paste half a building into the sky. Heavy
+  dependency, never the default path.
+- https://github.com/facebookresearch/dinov2 - DINOv2 self-supervised patch
+  features. Optional `metric=learned` phase via ONNX; better "same texture,
+  different phase" matching for clouds and water than RGB statistics. Inference
+  only, no training.
+- https://github.com/carhartt21/SkyCloudNet - sky and cloud segmentation
+  (ICIVC 2023) with published weights. A lighter `shape=semantic` candidate than
+  SAM 2 for the cloud case, if a sky-specific mask is ever needed.
+- https://github.com/javgat/SkyMaskConvLSTM - all-sky cloud masks + short-term
+  cloud prediction. Background reading for what "a plausible future cloud"
+  means; the effect copies real future pixels, it does not predict them.
 
 ### vhs (feeds E2.5, E2.12 and the crt family)
 

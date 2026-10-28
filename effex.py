@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # effex - terminal menu for weird video effects
-# v0.11.0 - Made by kaffeindecaf
+# v0.14.0 - Made by kaffeindecaf
 #
 #   interactive:  ./effex.py
 #   scripted:     ./effex.py stretch input/clip.mp4
@@ -34,8 +34,9 @@ from pathlib import Path
 from typing import Callable, Optional, cast
 
 from stateful_effects import CausalityInversion, ElasticCollapse, TemporalSediment
+from future_cut import FutureCut
 
-VERSION = "0.12.0"
+VERSION = "0.14.0"
 
 ROOT = Path(os.path.dirname(os.path.realpath(__file__)))
 # the folders can be pointed elsewhere (env or --input-dir/--output-dir);
@@ -917,9 +918,22 @@ def build_posterize(ctx: EffectContext) -> Plan:
     )
 
 
+DATAMOSH_PRESETS = {
+    "standard": {"cut": "heavy", "fill": "next", "hold": 150, "grit": 2,
+                 "bloom": 1, "bloom_window": 1},
+    "heavy": {"cut": "heavy", "fill": "chaos", "hold": 12, "grit": 18,
+              "bloom": 12, "bloom_window": 2},
+}
+
+
 DATAMOSH_PARAMS = (
     Param("second", "second video", "append another video before the codec melt",
           "video", "none"),
+    Param("preset", "mosh preset", "load tuned codec settings; individual knobs stay editable",
+          "choice", "heavy", choices=(
+              ("heavy", "heavy", "crushed encode, no recovery frames, repeated motion bursts"),
+              ("standard", "standard", "classic keyframe removal without motion blooming"),
+          )),
     Param("second_start", "second start", "seconds into the second video",
           "float", 0.0, minimum=0.0, maximum=3600.0, step=0.5),
     Param("second_length", "second length", "seconds to use; 0 means to the end",
@@ -936,16 +950,20 @@ DATAMOSH_PARAMS = (
           )),
     Param("survival", "keyframe survival", "chance a keyframe survives in dice mode",
           "percent", 25, minimum=0, maximum=100, step=5),
-    Param("fill", "fill", "what fills each cut keyframe", "choice", "next",
+    Param("fill", "fill", "what fills each cut keyframe", "choice", "chaos",
           choices=(
               ("next", "next frame", "drift into the next motion frame"),
               ("prev", "previous frame", "freeze on the last clean frame"),
               ("chaos", "chaos", "a random motion frame from anywhere"),
           )),
     Param("hold", "hold", "frames between keyframes - how long a melt runs",
-          "int", 150, minimum=2, maximum=600, step=2),
+          "int", 12, minimum=2, maximum=600, step=2),
     Param("grit", "grit", "how crunchy the intermediate encode is",
-          "int", 2, minimum=1, maximum=31, step=1),
+          "int", 18, minimum=1, maximum=31, step=1),
+    Param("bloom", "motion bloom", "reuse prediction data over this many frame slots; 1 disables",
+          "int", 12, minimum=1, maximum=60, step=1),
+    Param("bloom_window", "motion window", "number of motion frames cycled inside each bloom burst",
+          "int", 2, minimum=1, maximum=12, step=1),
     Param("seed", "random seed", "0 uses a repeatable seed derived from the input",
           "int", 0, minimum=0, maximum=2147483647, step=1),
     Param("audio", "audio", "audio stream to keep when rendering",
@@ -961,8 +979,8 @@ DATAMOSH_PARAMS = (
 def build_datamosh(ctx: EffectContext) -> Plan:
     opts = ctx.opts
     cut = str(opts.get("cut", "heavy"))
-    fill = str(opts.get("fill", "next"))
-    hold = _clamp_int(ctx.opts.get("hold", 150), 150, 2, 600)
+    fill = str(opts.get("fill", "chaos"))
+    hold = _clamp_int(ctx.opts.get("hold", 12), 12, 2, 600)
     second = str(opts.get("second", "none"))
     width, height = _source_dims(ctx.clip, ctx.frame)
     suffix = "_DATAMOSHED"
@@ -975,6 +993,8 @@ def build_datamosh(ctx: EffectContext) -> Plan:
         "real datamosh - i-vops are cut from the mpeg4 bitstream and "
         "the decoder smears each run of motion vectors across the gap",
         f"{cut} cut, {fill} fill, {hold}-frame keyframe interval",
+        f"{opts.get('preset', 'heavy')} preset: grit {opts.get('grit', 18)}, "
+        f"motion bloom {opts.get('bloom', 12)} / window {opts.get('bloom_window', 2)}",
         "removed keyframes are replaced by a fill frame, so the clip "
         "keeps its length and its audio sync",
     ]
@@ -992,8 +1012,8 @@ def build_datamosh(ctx: EffectContext) -> Plan:
         notes.append("dice: keyframe survival chance is configurable, "
                      "seeded from the input or a chosen seed")
     return Plan(
-        vf=(f"pass 1: mpeg4 keyint={hold} i-vop stream, then {cut} i-vop "
-            f"strip with {fill} fill, pass 2: straight remux"),
+        vf=(f"pass 1: mpeg4 keyint={hold}, {cut} cut, {fill} fill, "
+            f"bloom={opts.get('bloom', 12)}, pass 2: remux"),
         out_suffix=suffix,
         width=width,
         height=height,
@@ -1002,15 +1022,20 @@ def build_datamosh(ctx: EffectContext) -> Plan:
 
 
 def strip_ivops(raw: bytes, cut: str, fill: str, seed: int,
-                survival: int = 25) -> bytes:
+                survival: int = 25, bloom: int = 1,
+                bloom_window: int = 1) -> bytes:
     """cut i-vops out of an mpeg4 part 2 (m4v) bitstream.
 
     cut: heavy keeps only the first i-vop, medium every 2nd, light every
     3rd, dice keeps keyframes at the configured survival percentage, with
     deterministic randomness from seed. every removed keyframe is replaced by a fill frame - next (the following p-vop), prev
     (the last clean p-vop) or chaos (a random p-vop, seeded) - so the frame
-    count and the audio sync survive the cut. headers (vos/vol/gov) and
-    p-vops pass through untouched."""
+    count and the audio sync survive the cut. Bloom reuses prediction data
+    across existing frame slots, preserving their MPEG-4 time headers."""
+    from bisect import bisect_left
+    from datamosh_stream import bloom_pvops, clock_bits, retime_vop
+
+    time_width = clock_bits(raw)
     sc = b"\x00\x00\x01"
     units = []
     i = 0
@@ -1062,28 +1087,29 @@ def strip_ivops(raw: bytes, cut: str, fill: str, seed: int,
         rng.shuffle(pool)
         out = bytearray()
         out += b"".join(units[:first_i + 1])
-        out += b"".join(units[idx] for idx in pool)
-        return bytes(out)
+        targets = [unit for unit in units[first_i + 1:] if ctype(unit) >= 0]
+        for donor, target in zip(pool, targets):
+            out += retime_vop(units[donor], target, time_width)
+        return bloom_pvops(bytes(out), bloom, bloom_window)
 
     out = bytearray()
     for idx, unit in enumerate(units):
         if idx not in drop:
             out += unit
             continue
+        if not pvops:
+            out += unit  # an all-keyframe clip has no prediction data to borrow
+            continue
+        position = bisect_left(pvops, idx)
         if fill == "next":
-            for later in units[idx + 1:]:
-                if ctype(later) == 1:
-                    out += later
-                    break
+            donor_idx = pvops[min(position, len(pvops) - 1)]
         elif fill == "prev":
-            for earlier in reversed(units[:idx]):
-                if ctype(earlier) == 1:
-                    out += earlier
-                    break
+            donor_idx = pvops[max(0, position - 1)]
         else:                                    # chaos
-            if pvops:
-                out += units[rng.choice(pvops)]
-    return bytes(out)
+            donor_idx = rng.choice(pvops)
+        donor = units[donor_idx]
+        out += retime_vop(donor, unit, time_width)
+    return bloom_pvops(bytes(out), bloom, bloom_window)
 
 
 def resolve_second_video(raw: object, input_dir: Path,
@@ -1107,14 +1133,84 @@ def resolve_second_video(raw: object, input_dir: Path,
     return candidate.resolve(), ""
 
 
+def run_blockswap(ctx: EffectContext, clip: Clip, tools: Tools, args,
+                  dst: Path, run_encode, on_progress, animate) -> tuple:
+    """apply the swaprect layout, then optionally mosh the whole stream."""
+    effect = EFFECT_BY_KEY["blockswap"]
+    opts = ctx.opts
+    plan = build_plan(effect, ctx)
+    mosh = _clamp_int(opts.get("mosh", 0), 0, 0, 100)
+    if mosh <= 0:
+        # no codec pass requested: the filters plus the normal encoder are enough
+        inner = EffectContext(clip=clip, width=ctx.width, height=ctx.height,
+                              suffix=ctx.suffix, crf=ctx.crf,
+                              preset=ctx.preset,
+                              opts={effect.key: dict(opts)})
+        cmd, _plan = build_command(Chain((effect,)), inner, clip, tools, dst)
+        rc, stderr, took = run_encode(cmd, clip.duration, on_progress, animate)
+        return rc == 0, stderr, took
+
+    grit = _clamp_int(opts.get("mosh_grit", 12), 12, 1, 31)
+    hold = _clamp_int(opts.get("mosh_hold", 12), 12, 2, 600)
+    # light by default: higher mosh keeps fewer recovery keyframes and blooms more
+    survival = max(5, 100 - mosh)
+    bloom = max(1, min(8, int(round(mosh / 12.0))))
+    chosen_seed = _clamp_int(opts.get("seed", 0), 0, 0, 2147483647)
+    seed = chosen_seed or (20260925 + (clip.size % 10000))
+
+    raw = Path(args.output_dir) / f".{clip.path.stem}_bswap_{os.getpid()}.m4v"
+    stderr_parts, elapsed = [], 0.0
+    try:
+        cmd1 = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
+                "-i", str(clip.path), "-vf", plan.vf, "-an",
+                "-c:v", "mpeg4", "-q:v", str(grit), "-g", str(hold),
+                "-bf", "0", "-f", "m4v", "-progress", "pipe:1",
+                "-nostats", "-loglevel", "error", str(raw)]
+        rc, stderr, took = run_encode(cmd1, clip.duration, on_progress,
+                                      animate)
+        elapsed += took
+        stderr_parts.append(stderr)
+        if rc != 0:
+            return False, "\n".join(stderr_parts), elapsed
+        if not raw.exists() or raw.stat().st_size == 0:
+            return False, "the mosh pass produced no stream", elapsed
+        raw.write_bytes(strip_ivops(raw.read_bytes(), "dice", "chaos", seed,
+                                    survival, bloom=bloom))
+
+        cmd2 = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
+                "-f", "m4v", "-i", str(raw), "-i", str(clip.path)]
+        cmd2 += ["-map", "0:v:0"]
+        if clip.audio:
+            cmd2 += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", "192k",
+                     "-ac", "2"]
+        else:
+            cmd2 += ["-an"]
+        cmd2 += ["-c:v", "copy", "-movflags", "+faststart",
+                 "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+                 str(dst)]
+        rc, stderr, took = run_encode(cmd2, clip.duration, on_progress,
+                                      animate)
+        elapsed += took
+        stderr_parts.append(stderr)
+        if rc != 0:
+            return False, "\n".join(stderr_parts), elapsed
+        return True, "\n".join(stderr_parts), elapsed
+    finally:
+        try:
+            if raw.exists():
+                raw.unlink()
+        except OSError:
+            pass
+
+
 def run_datamosh(ctx: EffectContext, clip: Clip, tools: Tools, args,
                  dst: Path, run_encode, on_progress, animate) -> tuple:
     """encode one or two videos into an mpeg4 stream, edit its i-vops, remux."""
     opts = ctx.opts
     cut = str(opts.get("cut", "heavy"))
-    fill = str(opts.get("fill", "next"))
-    hold = _clamp_int(opts.get("hold", 150), 150, 2, 600)
-    grit = _clamp_int(opts.get("grit", 2), 2, 1, 31)
+    fill = str(opts.get("fill", "chaos"))
+    hold = _clamp_int(opts.get("hold", 12), 12, 2, 600)
+    grit = _clamp_int(opts.get("grit", 18), 18, 1, 31)
     survival = _clamp_int(opts.get("survival", 25), 25, 0, 100)
     chosen_seed = _clamp_int(opts.get("seed", 0), 0, 0, 2147483647)
     second, problem = resolve_second_video(opts.get("second", "none"),
@@ -1180,8 +1276,10 @@ def run_datamosh(ctx: EffectContext, clip: Clip, tools: Tools, args,
             return False, "\n".join(stderr_parts), elapsed
         if not raw.exists() or raw.stat().st_size == 0:
             return False, "pass 1 produced no stream", elapsed
-        raw.write_bytes(strip_ivops(raw.read_bytes(), cut, fill, seed,
-                                    survival))
+        raw.write_bytes(strip_ivops(
+            raw.read_bytes(), cut, fill, seed, survival,
+            bloom=int(opts.get("bloom", 12)),
+            bloom_window=int(opts.get("bloom_window", 2))))
 
         cmd2 = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
                 "-f", "m4v", "-i", str(raw)]
@@ -1607,39 +1705,109 @@ def build_neon(ctx: EffectContext) -> Plan:
 
 
 BLOCKSWAP_PARAMS = (
-    Param("size", "block size", "how big the swapped blocks are "
-           "(percent of the frame)", "int", 25, minimum=10, maximum=60,
+    Param("size", "block size", "how big each swapped block is "
+           "(percent of the frame)", "int", 20, minimum=5, maximum=60,
            step=5),
-    Param("speed", "speed", "how fast the blocks travel", "choice", "slow",
-          choices=(("slow", "slow", "a lazy drift"),
-                   ("fast", "fast", "a nervous slide"))),
+    Param("blocks", "blocks", "how many block pairs trade places",
+          "int", 3, minimum=1, maximum=8, step=1),
+    Param("teleport", "teleport secs", "seconds per block layout; 0 keeps one layout forever",
+          "float", 3.0, minimum=0, maximum=30, step=0.5),
+    Param("mosh", "mosh strength", "light codec datamosh over the whole clip; 0 disables",
+          "percent", 0, minimum=0, maximum=100, step=5),
+    Param("mosh_grit", "mosh grit", "how crunchy the intermediate mosh encode is",
+          "int", 12, minimum=1, maximum=31, step=1),
+    Param("mosh_hold", "mosh hold", "frames between keyframes in the mosh encode",
+          "int", 12, minimum=2, maximum=600, step=2),
+    Param("seed", "random seed", "0 derives a repeatable layout from the clip",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
 )
-
-BLOCKSWAP_PERIOD = {"slow": 2.0, "fast": 0.5}
 
 
 def build_blockswap(ctx: EffectContext) -> Plan:
-    size = _clamp_int(ctx.opts.get("size", 25), 25, 10, 60)
-    speed = str(ctx.opts.get("speed", "slow"))
-    period = BLOCKSWAP_PERIOD.get(speed, 2.0)
+    size = _clamp_int(ctx.opts.get("size", 20), 20, 5, 60)
+    blocks = _clamp_int(ctx.opts.get("blocks", 3), 3, 1, 8)
+    try:
+        teleport = max(0.0, min(30.0, float(ctx.opts.get("teleport", 3.0))))
+    except (TypeError, ValueError):
+        teleport = 3.0
+    mosh = _clamp_int(ctx.opts.get("mosh", 0), 0, 0, 100)
+    chosen_seed = _clamp_int(ctx.opts.get("seed", 0), 0, 0, 2147483647)
     w, h = _source_dims(ctx.clip, ctx.frame)
     if not w or not h:
         w, h = ctx.width or DEFAULT_W, ctx.height or DEFAULT_H
     bw = max(2, int(w * size / 100) // 2 * 2)
     bh = max(2, int(h * size / 100) // 2 * 2)
-    span = f"(w-{bw})/2"
+    bw = min(bw, max(2, w // 2 // 2 * 2))
+    bh = min(bh, max(2, h // 2 // 2 * 2))
+    seed = chosen_seed or (20261025 + (ctx.clip.size % 10000))
+
+    def apart(a, b):
+        ax, ay, aw, ah = a
+        bx, by, bw_, bh_ = b
+        return (ax + aw <= bx or bx + bw_ <= ax
+                or ay + ah <= by or by + bh_ <= ay)
+
+    def place(rng, used):
+        """Pick two rectangles that fit the frame and avoid earlier swaps."""
+        max_x, max_y = max(0, w - bw), max(0, h - bh)
+        for _ in range(96):
+            x1, y1 = (rng.randint(0, max_x) // 2 * 2,
+                      rng.randint(0, max_y) // 2 * 2)
+            first = (x1, y1, bw, bh)
+            if not all(apart(first, rect) for rect in used):
+                continue
+            x2, y2 = (rng.randint(0, max_x) // 2 * 2,
+                      rng.randint(0, max_y) // 2 * 2)
+            second = (x2, y2, bw, bh)
+            clear = (not (first[0] + bw > second[0]
+                          and second[0] + bw > first[0]
+                          and first[1] + bh > second[1]
+                          and second[1] + bh > first[1]))
+            if clear and all(apart(second, rect) for rect in used):
+                return x1, y1, x2, y2
+        # Too crowded for a clean layout: keep the deterministic fallback.
+        return 0, 0, max(0, w - bw) // 2 * 2, max(0, h - bh) // 2 * 2
+
+    duration = float(ctx.clip.duration or 0.0)
+    windows = 1
+    if teleport > 0 and duration > 0:
+        whole = int(duration // teleport)
+        leftover = duration - whole * teleport
+        windows = max(1, whole + (1 if leftover > 0.2 * teleport else 0))
+    # a long clip must not explode into hundreds of swaprect filters
+    windows = max(1, min(windows, max(1, 48 // blocks)))
+
+    swaps = []
+    for window in range(windows):
+        used = []
+        rng = random.Random(seed * 1000003 + window * 97)
+        for pair in range(blocks):
+            x1, y1, x2, y2 = place(rng, used)
+            used += [(x1, y1, bw, bh), (x2, y2, bw, bh)]
+            swap = (f"swaprect=w={bw}:h={bh}:x1={x1}:y1={y1}"
+                    f":x2={x2}:y2={y2}")
+            if windows > 1:
+                start = window * teleport
+                if window == windows - 1:
+                    swap += f":enable='gte(t,{start:g})'"
+                else:
+                    swap += (f":enable='between(t,{start:g},"
+                             f"{(window + 1) * teleport:g})'")
+            swaps.append(swap)
     return Plan(
-        vf=(f"swaprect=w={bw}:h={bh}"
-            f":x1='{span}*(1+sin(2*PI*t/{period:g}))'"
-            f":y1='(h-{bh})/2'"
-            f":x2='{span}*(1-sin(2*PI*t/{period:g}))'"
-            f":y2='(h-{bh})/2'"),
+        vf=",".join(swaps),
         out_suffix="_BLOCKSWAP",
         width=w,
         height=h,
         notes=[
-            "two blocks slide through each other",
-            f"{size}% blocks, {speed} travel",
+            (f"{blocks} block pairs hold each layout, then teleport"
+             if windows > 1 else
+             f"{blocks} block pairs trade places once and stay put"),
+            f"{size}% blocks at seeded positions",
+            (f"new layout every {teleport:g}s ({windows} windows on this clip)"
+             if windows > 1 else "one static layout"),
+            (f"light codec mosh over the whole clip at {mosh}% - teleports "
+             f"smear into the stream" if mosh else "no codec mosh"),
         ],
     )
 
@@ -1943,9 +2111,11 @@ COLLAPSE_PARAMS = (
           "percent", 80, minimum=0, maximum=100, step=5),
     Param("seed", "random seed", "0 derives repeatable elastic phases from the clip",
           "int", 0, minimum=0, maximum=2147483647, step=1),
-    Param("block_size", "pixel blocks", "larger blocks make the output chunkier",
+    Param("pixelate", "pixelate", "finish with chunky pixel blocks; off keeps the smooth remap",
+          "bool", False),
+    Param("block_size", "pixel blocks", "larger blocks make the output chunkier; pixelate only",
           "int", 4, minimum=1, maximum=16, step=1),
-    Param("mosh", "block carry", "blend prior-frame blocks in moving areas; not codec datamosh",
+    Param("mosh", "block carry", "blend prior-frame blocks in moving areas; pixelate only",
           "percent", 60, minimum=0, maximum=100, step=5),
 )
 
@@ -1959,10 +2129,100 @@ def build_collapse(ctx: EffectContext) -> Plan:
         notes=[
             "content-aware mode linearly shrinks over the clip and remaps to original dimensions",
             "seam analysis is capped at 192px; target scales remove at most half of either axis",
-            "a reduced pixel grid and partial moving-block carry add a restrained codec-mosh texture",
+            "pixelation is opt-in: off keeps the smooth warp, on adds the pixel grid and block carry",
             "elastic mode remains available for seeded smooth fields and CPU OpenCV remapping",
             "needs requirements-collapse.txt; no stateful preview or original VFR PTS",
         ],
+    )
+
+
+ARCHAEOLOGY_PARAMS = (
+    Param("lookahead", "look-ahead secs",
+          "how far the buffer sees ahead; also the output delay",
+          "float", 0.6, minimum=0.1, maximum=2.0, step=0.1),
+    Param("gap", "donor gap",
+          "frames ahead the borrowed cutout comes from",
+          "int", 18, minimum=1, maximum=60, step=1),
+    Param("cutouts", "cutouts",
+          "how many future cutouts can live at once",
+          "int", 1, minimum=1, maximum=3, step=1),
+    Param("spawn_every", "spawn every",
+          "frames between cutout spawns",
+          "int", 24, minimum=4, maximum=120, step=2),
+    Param("size", "cutout size",
+          "borrowed region area as a share of the frame",
+          "percent", 18, minimum=5, maximum=40, step=1),
+    Param("pick", "pick",
+          "which surface a cutout is taken from", "choice", "coherent",
+          choices=(("coherent", "coherent",
+                    "similar surface, different phase"),
+                   ("dissimilar", "dissimilar",
+                    "the least matching surface under the cap"),
+                   ("random", "random", "any textured region"))),
+    Param("min_motion", "min motion",
+          "ignore regions moving slower than this",
+          "percent", 2, minimum=0, maximum=30, step=1),
+    Param("max_motion", "max motion",
+          "ignore regions moving faster than this",
+          "percent", 25, minimum=1, maximum=100, step=1),
+    Param("similarity", "similarity",
+          "how close a surface must look to count as the same thing",
+          "percent", 60, minimum=0, maximum=100, step=5),
+    Param("shape", "shape",
+          "cutout outline", "choice", "blob",
+          choices=(("blob", "blob", "grown around the seed region"),
+                   ("rect", "rectangle", "one clean rectangle"))),
+    Param("seam", "seam blend",
+          "how the cutout edge is merged", "choice", "poisson",
+          choices=(("poisson", "poisson", "seamless clone into the frame"),
+                   ("none", "none", "plain mask, exact future pixels"))),
+    Param("feather", "edge feather",
+          "softness of the cutout border",
+          "percent", 35, minimum=0, maximum=100, step=5),
+    Param("hold", "hold frames",
+          "frames the cutout stays sharp before it dissolves",
+          "int", 6, minimum=1, maximum=30, step=1),
+    Param("melt", "melt frames",
+          "frames the cutout takes to dissolve away",
+          "int", 14, minimum=2, maximum=60, step=1),
+    Param("mode", "mosh out",
+          "how the cutout leaves", "choice", "smudge",
+          choices=(("smudge", "smudge",
+                    "flow-warped feedback smear"),
+                   ("slide", "dissolve",
+                    "noisy blotch dissolve"))),
+    Param("retention", "smudge carry",
+          "how much smeared detail each melt frame keeps",
+          "percent", 70, minimum=0, maximum=95, step=5),
+    Param("drift", "flow drift",
+          "how far the cutout follows its own motion; 0 pins it",
+          "percent", 100, minimum=0, maximum=100, step=5),
+    Param("seed", "random seed",
+          "0 derives repeatable cutout timing from the source",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_archaeology(ctx: EffectContext) -> Plan:
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    lookahead = max(0.1, min(2.0, float(ctx.opts.get("lookahead", 0.6))))
+    gap = _clamp_int(ctx.opts.get("gap", 18), 18, 1, 60)
+    hold = _clamp_int(ctx.opts.get("hold", 6), 6, 1, 30)
+    melt = _clamp_int(ctx.opts.get("melt", 14), 14, 2, 60)
+    seam = str(ctx.opts.get("seam", "poisson")).lower()
+    mode = str(ctx.opts.get("mode", "smudge")).lower()
+    return Plan(
+        vf="stateful future-cut frame pass",
+        out_suffix=ctx.suffix or "_EXCAVATED", width=width, height=height,
+        notes=[f"borrows a cutout from {gap} frame(s) ahead inside a "
+               f"{lookahead:g}s future buffer",
+               f"cutout lives {hold} sharp frames then {melt} melt frames "
+               f"({mode} out)",
+               ("poisson seam blending needs headless OpenCV; falls back to "
+                "a feathered alpha blend" if seam == "poisson" else
+                "plain masked paste - edges stay exact"),
+               "needs requirements-stateful.txt (NumPy); no stateful preview",
+               "keeps source PTS through the timestamped transport"],
     )
 
 
@@ -2005,7 +2265,7 @@ def build_inversion(ctx: EffectContext) -> Plan:
         out_suffix=ctx.suffix or "_INVERTED", width=width, height=height,
         notes=[f"buffers up to {lookahead:g}s to borrow {offset:g}s into the future",
                "preserves video PTS, dimensions and compatible unfiltered audio packets",
-               "EOF/cuts clamp to latest frame; 128 MiB/128-frame buffer budget",
+               "EOF/cuts clamp to latest frame; high resolutions shorten look-ahead to fit 128 MiB",
                "requires requirements-inversion.txt; aligned mode also needs headless OpenCV"],
     )
 
@@ -2049,13 +2309,13 @@ EFFECTS = [
            build=build_datamosh, params=DATAMOSH_PARAMS,
            run=run_datamosh,
            stages=(
-               "pass 1: ffmpeg -i <clip> -an -c:v mpeg4 -q:v 2 "
+               "pass 1: ffmpeg -i <clip> [-i <second>] -an -c:v mpeg4 -q:v <grit> "
                "-g <hold> -bf 0 -f m4v <clip>_mosh.m4v",
                "cut: strip_ivops() removes i-vops from the bitstream - "
                "heavy keeps 1, medium every 2nd, light every 3rd, dice "
                "uses configured survival, shuffle scrambles every motion frame; "
                "each hole takes the next, previous or a random motion "
-               "frame",
+               "frame; motion bloom reuses P-VOP data in existing frame slots",
                "pass 2: ffmpeg -f m4v -i <clip>_mosh.m4v [-i <clip> for "
                "the audio] -c:v copy -c:a aac <output>.mp4",
            )),
@@ -2092,9 +2352,16 @@ EFFECTS = [
            tag="hue=h=sin(2*PI*t/P),curves",
            build=build_neon, params=NEON_PARAMS),
     Effect(key="blockswap", name="blockswap",
-           blurb="two blocks slide through each other",
-           tag="swaprect moving blocks",
-           build=build_blockswap, params=BLOCKSWAP_PARAMS),
+           blurb="blocks trade places, teleport on a timer, optional mosh",
+           tag="swaprect fixed rectangles, teleport windows, optional light mosh",
+           build=build_blockswap, params=BLOCKSWAP_PARAMS,
+           run=run_blockswap,
+           stages=(
+               "layout: swaprect chain, one seeded layout per teleport window",
+               "optional mosh: mpeg4 encode with grit/hold, i-vop strip, "
+               "motion bloom over the whole clip",
+               "pass 2: remux the mosh stream with the source audio",
+           )),
     Effect(key="dropout", name="dropout",
            blurb="frames vanish at random - the picture holds",
            tag="select=gt(random(0),C)",
@@ -2117,8 +2384,8 @@ EFFECTS = [
                "pass 2: ffmpeg -f concat -i list.txt -c copy <output>.mp4",
            )),
     Effect(key="collapse", name="elastic collapse",
-           blurb="progressive content-aware scale with pixelated block mosh",
-           tag="seam carve, pixel grid, motion block carry",
+           blurb="progressive content-aware scale, optional pixel mosh",
+           tag="seam carve + smooth remap; pixel grid and block carry are opt-in",
            build=build_collapse, params=COLLAPSE_PARAMS,
            frame_processor=ElasticCollapse,
            stages=(
@@ -2134,6 +2401,15 @@ EFFECTS = [
            stages=("decode timestamped RGB frames through earlier FFmpeg filters",
                    "buffer future frames, mix selected regions, clamp unavailable future at EOF",
                    "encode on original video PTS with later filters and source audio")),
+    Effect(key="archaeology", name="pixel archaeology",
+           blurb="borrow a cutout from the future, then melt it away",
+           tag="buffered future cutouts, coherent blobs, flow smudge",
+           build=build_archaeology, params=ARCHAEOLOGY_PARAMS,
+           frame_processor=FutureCut,
+           stages=("decode RGB frames through earlier FFmpeg filters",
+                   "buffer look-ahead, pick a coherent future cutout, "
+                   "hold it, then dissolve it",
+                   "encode with later filters and source audio")),
     Effect(key="sediment", name="temporal sediment",
            blurb="deposit frames into bounded, decaying visual history",
            tag="stateful Python frame processor",
@@ -2157,7 +2433,7 @@ EFFECT_GROUPS = (
         "lobotomy", "neon",
     )),
     ("TIME & MEMORY", (
-        "trails", "timescratch", "sediment", "dropout", "inversion",
+        "trails", "timescratch", "sediment", "dropout", "inversion", "archaeology",
     )),
     ("CODEC & BLOCKS", (
         "datamosh", "blockswap", "crunch",
@@ -2383,6 +2659,7 @@ def apply_cli_opts(chain: Chain, args) -> tuple:
     as `effect.key=value`.
     """
     opts = default_chain_opts(chain)
+    explicit = {effect.key: {} for effect in chain.effects}
     for raw in args.set or []:
         if "=" not in raw:
             return opts, f"--set wants key=value, got {raw!r}"
@@ -2416,6 +2693,19 @@ def apply_cli_opts(chain: Chain, args) -> tuple:
         if problem:
             return opts, problem
         opts[effect.key][param.key] = coerced
+        explicit[effect.key][param.key] = coerced
+    if "datamosh" in opts:
+        mine = opts["datamosh"]
+        mine.update(DATAMOSH_PRESETS[mine["preset"]])
+        mine.update(explicit["datamosh"])
+    second_video = getattr(args, "second_video", None)
+    if second_video is not None:
+        if "datamosh" not in opts:
+            return opts, "--with is only available for datamosh"
+        chosen = explicit["datamosh"].get("second")
+        if chosen is not None and chosen != second_video:
+            return opts, "conflicting second videos: use --with or --set second, not both"
+        opts["datamosh"]["second"] = second_video
     if args.size_given:
         # the request shape belongs to the first effect that has one - a second
         # shape option further down the chain is reachable with its own --set
@@ -2614,6 +2904,9 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
                 seed = 20261023 + (clip.size % 1000003)
             processor.initialize(opts, (height, width, 3), fps, seed)
             processors.append(processor)
+            notes = getattr(processor, "runtime_notes", [])
+            if notes:
+                last_render.setdefault("warnings", []).extend(notes)
     except Exception as exc:
         return False, f"could not initialize {chain.name}: {exc}", 0.0
 
@@ -2883,14 +3176,20 @@ last_render: dict = {}
 
 def process(chain: Chain, clip: Clip, tools: Tools, args,
             opts_override: Optional[dict] = None) -> bool:
+    last_render.clear()
+
+    def failed(message: str) -> bool:
+        last_render["error"] = message
+        err(message)
+        return False
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if opts_override is not None:
         opts = dict(opts_override)
     else:
         opts, problem = apply_cli_opts(chain, args)
         if problem:
-            err(problem)
-            return False
+            return failed(problem)
     ctx = EffectContext(clip=clip, width=args.width, height=args.height,
                         suffix=args.suffix, crf=args.crf, preset=args.preset,
                         opts=opts)
@@ -2898,8 +3197,7 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
     dst = resolve_output(clip, args, plan)
 
     if getattr(args, "output", "") and dst.exists() and not got_force(args):
-        err(f"{dst} already exists - add --force to overwrite")
-        return False
+        return failed(f"{dst} already exists - add --force to overwrite")
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     if not clip.duration or clip.duration <= 0:
@@ -2934,21 +3232,36 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
         if args.dry_run:
             for line in chain.stage_lines:
                 _say("  " + line)
-            if pass_effect is not None and pass_effect.key == "datamosh":
+            if pass_effect is not None:
+                values = opts_of(opts, pass_effect)
                 for param in pass_effect.params:
-                    value = opts_of(opts, pass_effect)[param.key]
-                    _say(f"  {param.key}={param.display(value)}")
-                second_raw = opts_of(opts, pass_effect).get("second", "none")
-                second_path, _problem = resolve_second_video(
-                    second_raw, Path(args.input_dir), clip.path)
-                if second_path:
-                    _say("  second source: " + str(second_path))
+                    _say(f"  {param.key}={param.display(values[param.key])}")
+                if pass_effect.key == "datamosh":
+                    second_raw = values.get("second", "none")
+                    second_path, _problem = resolve_second_video(
+                        second_raw, Path(args.input_dir), clip.path)
+                    if second_path:
+                        _say("  second source: " + str(second_path))
+                pass_plan = build_plan(pass_effect, ctx)
+                if pass_plan.vf:
+                    _say("  filter: " + pass_plan.vf)
+                for note in pass_plan.notes:
+                    _say("  \u00b7 " + note)
             elif chain.stateful_effects:
                 for effect in chain.stateful_effects:
                     values = opts_of(opts, effect)
                     for param in effect.params:
                         _say(f"  {effect.key}.{param.key}="
                              f"{param.display(values[param.key])}")
+                for effect in chain.stateful_effects:
+                    state_plan = build_plan(effect, EffectContext(
+                        clip=clip, width=ctx.width, height=ctx.height,
+                        suffix=effect.key.upper(), crf=args.crf,
+                        preset=args.preset, opts=opts_of(opts, effect)))
+                    if state_plan.vf:
+                        _say(f"  {effect.key}: {state_plan.vf}")
+                    for note in state_plan.notes:
+                        _say(f"  {effect.key} \u00b7 {note}")
             return True
     else:
         cmd, plan = build_command(chain, ctx, clip, tools, dst)
@@ -3041,14 +3354,15 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
                                           run_encode, on_progress, animate)
         except KeyboardInterrupt:
             drop_partial(dst, clip.path)
+            last_render["error"] = "cancelled, partial file removed"
             warn("cancelled, partial file removed")
             return False
         except Exception as exc:
             drop_partial(dst, clip.path)
-            err(f"{chain.name} failed: {exc}")
-            return False
+            return failed(f"{chain.name} failed: {exc}")
         if not okk:
             drop_partial(dst, clip.path)
+            last_render["error"] = stderr.strip() or "FFmpeg failed without an error message"
             err("ffmpeg failed, partial file removed")
             for line in stderr.splitlines()[-6:]:
                 print("    " + C_DIM + line + NC, file=sys.stderr)
@@ -3059,19 +3373,20 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
                                              animate)
         except KeyboardInterrupt:
             drop_partial(dst, clip.path)
+            last_render["error"] = "cancelled, partial file removed"
             warn("cancelled, partial file removed")
             return False
 
         if rc != 0:
             drop_partial(dst, clip.path)
+            last_render["error"] = stderr.strip() or f"FFmpeg exited {rc}"
             err(f"ffmpeg failed (exit {rc}), partial file removed")
             for line in stderr.splitlines()[-6:]:
                 print("    " + C_DIM + line + NC, file=sys.stderr)
             return False
 
     if not dst.exists() or dst.stat().st_size == 0:
-        err("ffmpeg reported success but no output was written")
-        return False
+        return failed("ffmpeg reported success but no output was written")
 
     out_size = dst.stat().st_size
     speed = (render_duration / elapsed) if (render_duration and elapsed > 0) \
@@ -3093,6 +3408,8 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
         }
         if not chain.single:
             payload["chain"] = [e.key for e in chain.effects]
+        if last_render.get("warnings"):
+            payload["warnings"] = last_render["warnings"]
         _say(json.dumps(payload))
         return True
 
@@ -3101,6 +3418,8 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
        + ")" + NC)
     if not _QUIET:
         hint(str(dst))
+        for note in last_render.get("warnings", []):
+            warn(note)
     return True
 
 
@@ -3833,12 +4152,27 @@ def screen_effect_options(chain: Chain, clip: Clip, tools: Tools, args,
     rows = option_rows(chain)
     idx = next((i for i, r in enumerate(rows) if r.kind != "head"), 0)
     notice = initial_notice
+    last_mosh_preset = opts.get("datamosh", {}).get("preset")
+    top = 0
 
     while True:
+        if "datamosh" in opts:
+            mine = opts["datamosh"]
+            if mine["preset"] != last_mosh_preset:
+                mine.update(DATAMOSH_PRESETS[mine["preset"]])
+                last_mosh_preset = mine["preset"]
         cols = term_cols()
         width = cols - 6
         body = []
-        for i, entry in enumerate(rows):
+        reserve = 12 + (0 if chain.single else len(chain.effects))
+        page = max(1, min(len(rows), term_rows() - reserve - (2 if notice else 0)))
+        top = max(0, min(top, len(rows) - page))
+        if idx < top:
+            top = idx
+        elif idx >= top + page:
+            top = idx - page + 1
+        for i in range(top, min(len(rows), top + page)):
+            entry = rows[i]
             if entry.kind == "head":
                 body.append("  " + B + C_FROST + fit(entry.effect.name, 13)
                             + NC + "  " + C_DIM
@@ -3861,6 +4195,10 @@ def screen_effect_options(chain: Chain, clip: Clip, tools: Tools, args,
                     + fit(param.display(mine[param.key]), 24)
                     + C_DIM + trunc(param.help + extra, width - 44) + NC)
             body.append(row(text, i == idx))
+        if page < len(rows):
+            body.append("  " + C_DIM + trunc(
+                f"options {top + 1}-{min(len(rows), top + page)} of {len(rows)}"
+                + "  (arrows scroll)", width) + NC)
         try:
             plan = plan_for_chain(chain, make_ctx())
             out_name = clip.path.stem + plan.out_suffix + ".mp4"
@@ -4064,6 +4402,12 @@ def open_folder(path: Path) -> bool:
 def screen_done(args, ok_render: bool) -> None:
     if not ok_render or not last_render:
         body = ["  " + C_AMB + "no output file was written" + NC]
+        detail = str(last_render.get("error", ""))
+        if detail:
+            import textwrap
+            lines = [part for line in detail.splitlines()[-6:]
+                     for part in textwrap.wrap(line, max(12, term_cols() - 8))]
+            body += [""] + ["  " + C_DIM + line + NC for line in lines[-8:]]
         notice = C_RED + "render failed or was cancelled" + NC
         keys = ["enter main menu"]
     else:
@@ -4077,6 +4421,8 @@ def screen_done(args, ok_render: bool) -> None:
                        + (f"   {speed:.2f}x realtime" if speed else "")),
             kv("path", trunc(str(last_render["path"]), term_cols() - 14)),
         ]
+        for note in last_render.get("warnings", []):
+            body.append("  " + C_AMB + trunc(note, term_cols() - 6) + NC)
         notice = ""
         keys = ["enter main menu", "o open output folder"]
     while True:
@@ -4184,6 +4530,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="check ffmpeg/ffprobe and folders, exit 1 if missing")
     p.add_argument("--set", action="append", metavar="KEY=VALUE",
                    help="set an effect option, eg --set target=16:9")
+    p.add_argument("--with", dest="second_video", metavar="VIDEO",
+                   help="mash a second video into datamosh (heavy by default)")
     p.add_argument("--size", default=None, metavar="WxH",
                    help="shorthand for --set target=WxH")
     p.add_argument("--crf", type=int, default=DEFAULT_CRF,
@@ -4454,8 +4802,19 @@ def main(argv=None) -> int:
     return interactive_menu(args)
 
 
+def project_python(root: Path = ROOT) -> Optional[str]:
+    """Use local optional dependencies for plain launches, not active custom envs."""
+    if sys.flags.no_site or sys.prefix != sys.base_prefix:
+        return None
+    python = root / ".venv" / "bin" / "python3"
+    return str(python) if python.is_file() and os.access(python, os.X_OK) else None
+
+
 if __name__ == "__main__":
     try:
+        python = project_python()
+        if python:
+            os.execv(python, [python, str(Path(__file__).resolve()), *sys.argv[1:]])
         sys.exit(main())
     except BrokenPipeError:
         try:

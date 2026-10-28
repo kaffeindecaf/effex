@@ -19,6 +19,7 @@ HERE = Path(__file__).resolve().parent
 SUITES = {
     "cli": HERE / "cli_regression.py",
     "datamosh": HERE / "datamosh_features.py",
+    "mosh-stream": HERE / "datamosh_stream.py",
     "menu": HERE / "menu_smoke.py",
     "layout": HERE / "layout.py",
     "install": HERE / "install_prompt.py",
@@ -27,6 +28,8 @@ SUITES = {
     "collapse": HERE / "collapse_regression.py",
     "seams": HERE / "seam_carving_regression.py",
     "inversion": HERE / "inversion_regression.py",
+    "archaeology": HERE / "future_cut_regression.py",
+    "archaeology-cli": HERE / "archaeology_integration.py",
 }
 
 

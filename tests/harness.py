@@ -115,6 +115,16 @@ def newest_mp4(folder) -> Optional[Path]:
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
+def video_frames(path) -> int:
+    result = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                  "-show_entries", "stream=nb_frames", "-of", "csv=p=0",
+                  str(path)])
+    try:
+        return int(result.stdout.decode().strip() or 0)
+    except ValueError:
+        return 0
+
+
 def skip(message: str) -> int:
     print(f"  SKIP {message}")
     return 0
