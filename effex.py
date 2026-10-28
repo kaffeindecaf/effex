@@ -308,7 +308,21 @@ def refresh_windows_path() -> bool:
 
 
 def prepare_console() -> None:
-    """utf-8 + ansi escapes on windows consoles; a no-op everywhere else."""
+    """make stdout/stderr able to carry the tick and warning glyphs, and put a
+    windows console into utf-8 + ansi mode. a no-op when nothing needs it."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            encoding = getattr(stream, "encoding", "") or "ascii"
+            "\u2713".encode(encoding)
+        except (UnicodeEncodeError, LookupError):
+            # windows pipes default to cp1252 and a C locale to ascii - both
+            # crash on the first tick, so switch the stream to utf-8
+            try:
+                reconfigure = getattr(stream, "reconfigure", None)
+                if reconfigure is not None:
+                    reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError, OSError):
+                pass
     if not is_windows():
         return
     try:

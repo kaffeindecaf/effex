@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import effex  # noqa: E402
-from harness import Checker, have  # noqa: E402
+from harness import Checker, EFFEX, have, run  # noqa: E402
 
 
 def main() -> int:
@@ -198,6 +198,15 @@ def main() -> int:
     c.check("no venv, no re-exec",
             effex.venv_python_path(Path(tempfile.mkdtemp(prefix="effex-novenv-")),
                                    windows=True) is None)
+
+    # ---- a pipe in a non-utf-8 locale still prints the glyphs ---------
+    proc = run([EFFEX, "--check"], env_extra={"PYTHONIOENCODING": "ascii",
+                                              "NO_COLOR": "1"})
+    stream = proc.stdout + proc.stderr
+    c.check("a non-utf-8 stdout never crashes on the tick glyphs",
+            b"ffmpeg" in proc.stdout and b"UnicodeEncodeError" not in stream
+            and b"Traceback" not in stream,
+            stream.decode("utf-8", "replace")[-200:])
 
     # ---- which_tool agrees with shutil.which on this host --------------
     name = "ffmpeg" if have("ffmpeg") else "sh"
