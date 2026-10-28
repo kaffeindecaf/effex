@@ -69,7 +69,7 @@ def temp_folders(prefix: str = "effex-test-"):
 
 def env_for(in_dir, out_dir) -> dict:
     return {"EFFEX_INPUT_DIR": str(in_dir), "EFFEX_OUTPUT_DIR": str(out_dir),
-            "NO_COLOR": "1"}
+            "EFFEX_LOG_DIR": str(Path(in_dir).parent / "logs"), "NO_COLOR": "1"}
 
 
 def make_clip(path: Path, seconds: float = 3, size: str = "640x360",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # effex - terminal menu for weird video effects
-# v0.14.0 - Made by kaffeindecaf
+# v0.16.0 - Made by kaffeindecaf
 #
 #   interactive:  ./effex.py
 #   scripted:     ./effex.py stretch input/clip.mp4
@@ -18,8 +18,10 @@
 
 import argparse
 import difflib
+import importlib.util
 import json
 import math
+import platform
 import random
 import os
 import re
@@ -35,8 +37,9 @@ from typing import Callable, Optional, cast
 
 from stateful_effects import CausalityInversion, ElasticCollapse, TemporalSediment
 from future_cut import FutureCut
+from diagnostics import ISSUES_URL, LOG, log_dir
 
-VERSION = "0.14.0"
+VERSION = "0.16.0"
 
 ROOT = Path(os.path.dirname(os.path.realpath(__file__)))
 # the folders can be pointed elsewhere (env or --input-dir/--output-dir);
@@ -127,12 +130,14 @@ def ok(text: str) -> None:
         _say("  " + C_GRN + "\u2713" + NC + " " + text)
 
 
-def err(text: str) -> None:
+def err(text: str, detail: str = "") -> None:
+    LOG.error(text, detail)
     sys.stdout.flush()
     print("  " + C_RED + "\u2717" + NC + " " + text, file=sys.stderr)
 
 
-def warn(text: str) -> None:
+def warn(text: str, detail: str = "") -> None:
+    LOG.warn(text, detail)
     if not _QUIET:
         sys.stdout.flush()
         print("  " + C_AMB + "\u26a0" + NC + " " + text, file=sys.stderr)
@@ -170,20 +175,257 @@ def human_time(seconds: Optional[float]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ffmpeg discovery + install prompt
+# platform + requirements discovery
 # ---------------------------------------------------------------------------
 
+def host_os() -> str:
+    """the three platforms effex knows how to install packages on"""
+    name = platform.system().lower()
+    if name == "windows":
+        return "windows"
+    if name == "darwin":
+        return "macos"
+    return "linux"
+
+
+def linux_distro() -> str:
+    try:
+        text = Path("/etc/os-release").read_text(encoding="utf-8",
+                                                 errors="ignore")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        if line.startswith("ID="):
+            return line[3:].strip().strip('"').lower()
+    return ""
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+@dataclass(frozen=True)
+class Installer:
+    """one package manager: where it runs, what to look for, how to call it"""
+
+    manager: str
+    os_name: str
+    label: str
+    template: tuple
+    packages: dict = field(default_factory=dict)
+
+
 INSTALLERS = [
-    ("apt-get", ["sudo", "apt-get", "install", "-y", "ffmpeg"],
-     "debian / ubuntu / parrot / mint"),
-    ("dnf", ["sudo", "dnf", "install", "-y", "ffmpeg"], "fedora / rhel"),
-    ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "ffmpeg"],
-     "arch / manjaro"),
-    ("zypper", ["sudo", "zypper", "install", "-y", "ffmpeg"], "opensuse"),
-    ("apk", ["sudo", "apk", "add", "ffmpeg"], "alpine"),
-    ("brew", ["brew", "install", "ffmpeg"], "macos / linuxbrew"),
+    Installer("winget", "windows", "windows 10/11 - winget", (
+        "winget", "install", "-e", "--id", "{pkg}",
+        "--accept-package-agreements", "--accept-source-agreements"),
+        {"ffmpeg": "Gyan.FFmpeg", "ffprobe": "Gyan.FFmpeg"}),
+    Installer("choco", "windows", "windows - chocolatey", (
+        "choco", "install", "-y", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
+    Installer("scoop", "windows", "windows - scoop", (
+        "scoop", "install", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
+    Installer("brew", "macos", "macos - homebrew", (
+        "brew", "install", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
+    Installer("brew", "linux", "linuxbrew", (
+        "brew", "install", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
+    Installer("apt-get", "linux", "debian / ubuntu / parrot / mint", (
+        "sudo", "apt-get", "install", "-y", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
+    Installer("dnf", "linux", "fedora / rhel", (
+        "sudo", "dnf", "install", "-y", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
+    Installer("pacman", "linux", "arch / manjaro", (
+        "sudo", "pacman", "-S", "--noconfirm", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
+    Installer("zypper", "linux", "opensuse", (
+        "sudo", "zypper", "install", "-y", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
+    Installer("apk", "linux", "alpine", (
+        "sudo", "apk", "add", "{pkg}"),
+        {"ffmpeg": "ffmpeg", "ffprobe": "ffmpeg"}),
 ]
 
+# where the windows installers drop binaries that a fresh shell would find,
+# but this process (started before the install) does not have on PATH yet
+WINDOWS_TOOL_DIRS = (
+    ("LOCALAPPDATA", "Microsoft/WinGet/Links"),
+    ("PROGRAMFILES", "ffmpeg/bin"),
+    ("PROGRAMDATA", "chocolatey/bin"),
+    ("USERPROFILE", "scoop/shims"),
+)
+
+
+def windows_tool_dirs() -> list:
+    if not is_windows():
+        return []
+    folders = [Path("C:/ffmpeg/bin")]
+    for env, tail in WINDOWS_TOOL_DIRS:
+        root = os.environ.get(env)
+        if root:
+            folders.append(Path(root) / tail)
+    return [folder for folder in folders if folder.is_dir()]
+
+
+def which_tool(name: str) -> Optional[str]:
+    """PATH lookup that also knows the windows installer folders."""
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    extra = os.pathsep.join(str(folder) for folder in windows_tool_dirs())
+    return shutil.which(name, path=extra) if extra else None
+
+
+def refresh_windows_path() -> bool:
+    """re-read the PATH an installer wrote to the registry (windows only)."""
+    if not is_windows():
+        return False
+    try:
+        import winreg
+    except ImportError:
+        return False
+    chunks = [os.environ.get("PATH", "")]
+    for hive, key_path in (
+            (winreg.HKEY_CURRENT_USER, r"Environment"),  # type: ignore[attr-defined]
+            (winreg.HKEY_LOCAL_MACHINE,  # type: ignore[attr-defined]
+             r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+        try:
+            with winreg.OpenKey(hive, key_path) as key:  # type: ignore[attr-defined]
+                value, _kind = winreg.QueryValueEx(key, "Path")  # type: ignore[attr-defined]
+        except OSError:
+            continue
+        chunks.append(str(value))
+    merged = []
+    for chunk in chunks:
+        for piece in chunk.split(os.pathsep):
+            if piece and piece not in merged:
+                merged.append(piece)
+    os.environ["PATH"] = os.pathsep.join(merged)
+    return True
+
+
+def prepare_console() -> None:
+    """utf-8 + ansi escapes on windows consoles; a no-op everywhere else."""
+    if not is_windows():
+        return
+    try:
+        import ctypes
+    except ImportError:
+        return
+    try:
+        kernel32 = getattr(ctypes, "windll").kernel32
+        kernel32.SetConsoleOutputCP(65001)
+        kernel32.SetConsoleCP(65001)
+        for handle in (-11, -12):  # stdout, stderr
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(kernel32.GetStdHandle(handle),
+                                       ctypes.byref(mode)):
+                kernel32.SetConsoleMode(
+                    kernel32.GetStdHandle(handle),
+                    mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# requirements
+# ---------------------------------------------------------------------------
+
+OPTIONAL_MODULES = [
+    ("numpy", "sediment, collapse, inversion", "requirements-stateful.txt"),
+    ("cv2", "collapse seam detail", "requirements-collapse.txt"),
+    ("av", "inversion timestamps", "requirements-inversion.txt"),
+]
+
+
+@dataclass
+class Requirement:
+    key: str
+    label: str
+    required: bool
+    detail: str = ""
+    unlocks: str = ""
+    installable: bool = True
+    pip_file: str = ""
+
+    @property
+    def found(self) -> bool:
+        return bool(self.detail)
+
+
+def module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def check_requirements(tools: Optional["Tools"] = None) -> list:
+    """every prerequisite, in the order the menu lists them."""
+    tools = tools or find_tools()
+    python_fine = sys.version_info >= (3, 8)
+    reqs = [
+        Requirement("ffmpeg", "ffmpeg", True, tools.ffmpeg or "",
+                    "renders every effect"),
+        Requirement("ffprobe", "ffprobe", True, tools.ffprobe or "",
+                    "clip details, datamosh, frame effects"),
+        Requirement("python", "python", True,
+                    platform.python_version() if python_fine
+                    else f"{platform.python_version()} is too old, need 3.8+",
+                    "runs effex", installable=False),
+    ]
+    for module, unlocks, pip_file in OPTIONAL_MODULES:
+        reqs.append(Requirement(
+            module, "opencv" if module == "cv2" else module, False,
+            "installed" if module_available(module) else "",
+            unlocks, installable=False, pip_file=pip_file))
+    return reqs
+
+
+def missing_requirements(reqs: list) -> list:
+    return [r for r in reqs if r.required and not r.found]
+
+
+def requirement_summary(reqs: list) -> str:
+    missing = missing_requirements(reqs)
+    if not missing:
+        return f"all {sum(1 for r in reqs if r.required)} installed"
+    return (f"{len(missing)} missing: "
+            + ", ".join(r.label for r in missing))
+
+
+def requirement_lines(reqs: list, width: int) -> list:
+    """one row per requirement: a tick, the name, then where/what it is."""
+    lines = []
+    for req in reqs:
+        if req.found:
+            mark = C_GRN + "\u2713" + NC
+            detail = req.detail if req.required else "optional, installed"
+        elif req.required:
+            mark = C_RED + "\u2717" + NC
+            detail = req.detail or "not on PATH"
+        else:
+            mark = C_DIM + "\u00b7" + NC
+            detail = f"optional, not installed ({req.unlocks})"
+        lines.append("  " + mark + " " + fit(req.label, 8) + " " + C_DIM
+                     + trunc(detail, max(8, width - 16)) + NC)
+    return lines
+
+
+def pip_hint(reqs: list) -> str:
+    files = [r.pip_file for r in reqs if not r.required and not r.found
+             and r.pip_file]
+    if not files:
+        return ""
+    return "python -m pip install -r " + " -r ".join(files)
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg discovery + install prompt
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Tools:
@@ -192,61 +434,103 @@ class Tools:
 
     @property
     def ok(self) -> bool:
-        return bool(self.ffmpeg)
+        return bool(self.ffmpeg and self.ffprobe)
 
 
 def find_tools() -> Tools:
-    return Tools(shutil.which("ffmpeg"), shutil.which("ffprobe"))
+    return Tools(which_tool("ffmpeg"), which_tool("ffprobe"))
 
 
-def detect_installer() -> Optional[tuple]:
-    for name, cmd, label in INSTALLERS:
-        if shutil.which(name):
-            return name, cmd, label
+def installers_for(os_name: Optional[str] = None) -> list:
+    target = os_name or host_os()
+    return [item for item in INSTALLERS if item.os_name == target]
+
+
+def detect_installer(os_name: Optional[str] = None,
+                     which: Optional[Callable] = None) -> Optional[Installer]:
+    finder = which or shutil.which
+    for installer in installers_for(os_name):
+        if finder(installer.manager):
+            return installer
     return None
 
 
-def install_ffmpeg(tools: Tools, interactive: bool) -> Tools:
+def install_commands(installer: Installer, missing: list) -> list:
+    """one command per distinct package, so a per-package template stays right"""
+    seen, packages = set(), []
+    for key in missing:
+        package = installer.packages.get(key)
+        if package and package not in seen:
+            seen.add(package)
+            packages.append(package)
+    return [[package if part == "{pkg}" else part
+             for part in installer.template] for package in packages]
+
+
+def install_text(installer: Installer, missing: list) -> str:
+    commands = install_commands(installer, missing)
+    return " && ".join(" ".join(cmd) for cmd in commands)
+
+
+def install_requirements(tools: Tools, interactive: bool) -> Tools:
     """returns freshly detected Tools (unchanged if install skipped/failed)"""
-    hit = detect_installer()
-    if not hit:
-        err("no package manager found - install ffmpeg manually")
+    reqs = check_requirements(tools)
+    missing = missing_requirements(reqs)
+    if not missing:
+        return tools
+    names = " + ".join(req.label for req in missing)
+    installer = detect_installer()
+    if not installer:
+        err(f"no package manager found - install {names} manually")
         hint("https://ffmpeg.org/download.html")
         return tools
 
-    name, cmd, label = hit
-    shown = " ".join(cmd)
+    keys = [req.key for req in missing if req.installable]
+    shown = install_text(installer, keys) if keys else ""
+    if not keys:
+        err(f"{names} cannot be installed by effex")
+        hint("install python 3.8+ from https://www.python.org/downloads/")
+        return tools
 
     if not interactive:
-        err("ffmpeg is required to process video")
-        hint(f"install it with:  {shown}   ({label})")
+        err(f"{names} not on PATH - required to process video")
+        if shown:
+            hint(f"install it with:  {shown}   ({installer.label})")
         return tools
 
     _say()
-    warn("ffmpeg was not found on PATH")
-    info(f"detected package manager: {B}{name}{NC}  ({label})")
-    _say("  " + C_DIM + "will run: " + NC + C_FROST + shown + NC)
-    if not ask_yes_no("install ffmpeg now?", default=True):
-        warn("skipped install - effex cannot process anything without ffmpeg")
-        hint(f"do it later with:  {shown}")
+    warn(f"missing: {names}")
+    info(f"detected package manager: {B}{installer.manager}{NC}  "
+         f"({installer.label})")
+    if shown:
+        _say("  " + C_DIM + "will run: " + NC + C_FROST + shown + NC)
+    if not ask_yes_no(f"install {names} now?", default=True):
+        warn(f"skipped install - effex cannot process anything without {names}")
+        if shown:
+            hint(f"do it later with:  {shown}")
         return tools
 
     _say()
-    try:
-        rc = subprocess.run(cmd).returncode
-    except (OSError, KeyboardInterrupt) as exc:
-        err(f"install failed: {exc}")
-        return tools
+    for command in install_commands(installer, keys):
+        try:
+            rc = subprocess.run(command).returncode
+        except (OSError, KeyboardInterrupt) as exc:
+            err(f"install failed: {exc}")
+            return tools
+        if rc != 0:
+            err(f"installer exited with code {rc}  ({' '.join(command)})")
+            if is_windows() and installer.manager == "choco":
+                hint("chocolatey needs an elevated terminal - or use winget")
+            return tools
 
-    if rc != 0:
-        err(f"installer exited with code {rc}")
-        return tools
-
+    refresh_windows_path()
     fresh = find_tools()
-    if fresh.ok:
-        ok("ffmpeg installed")
+    left = missing_requirements(check_requirements(fresh))
+    if left:
+        err("still not on PATH: " + ", ".join(r.label for r in left)
+            + " - open a new shell and retry")
     else:
-        err("ffmpeg still not on PATH - open a new shell and retry")
+        ok("requirements installed")
     return fresh
 
 
@@ -254,7 +538,7 @@ def check_tools(interactive: bool) -> Tools:
     tools = find_tools()
     if tools.ok:
         return tools
-    return install_ffmpeg(tools, interactive)
+    return install_requirements(tools, interactive)
 
 
 # ---------------------------------------------------------------------------
@@ -3359,11 +3643,12 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
             return False
         except Exception as exc:
             drop_partial(dst, clip.path)
+            LOG.exception(exc, f"{chain.name} failed")
             return failed(f"{chain.name} failed: {exc}")
         if not okk:
             drop_partial(dst, clip.path)
             last_render["error"] = stderr.strip() or "FFmpeg failed without an error message"
-            err("ffmpeg failed, partial file removed")
+            err("ffmpeg failed, partial file removed", stderr)
             for line in stderr.splitlines()[-6:]:
                 print("    " + C_DIM + line + NC, file=sys.stderr)
             return False
@@ -3380,7 +3665,7 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
         if rc != 0:
             drop_partial(dst, clip.path)
             last_render["error"] = stderr.strip() or f"FFmpeg exited {rc}"
-            err(f"ffmpeg failed (exit {rc}), partial file removed")
+            err(f"ffmpeg failed (exit {rc}), partial file removed", stderr)
             for line in stderr.splitlines()[-6:]:
                 print("    " + C_DIM + line + NC, file=sys.stderr)
             return False
@@ -3445,7 +3730,37 @@ def term_rows() -> int:
     return max(1, terminal_size().lines)
 
 
+WINDOWS_KEY_NAMES = {
+    "H": "up", "P": "down", "M": "right", "K": "left",
+    "G": "home", "O": "end", "I": "pgup", "Q": "pgdn", "S": "delete",
+}
+
+
+def decode_windows_key(first: str, code: str = "") -> str:
+    """turn what msvcrt hands back into the names the menus compare against.
+
+    arrows and friends arrive as a NUL/0xe0 prefix followed by a code letter;
+    a lone escape is just esc because the console never sends sequences.
+    """
+    if first in ("\x00", "\xe0"):
+        return WINDOWS_KEY_NAMES.get(code, "esc")
+    if first == "\x1b":
+        return "esc"
+    return first
+
+
+def _read_key_windows() -> str:
+    import msvcrt
+    getwch = msvcrt.getwch  # type: ignore[attr-defined]
+    first = getwch()
+    if first in ("\x00", "\xe0"):
+        return decode_windows_key(first, getwch())
+    return decode_windows_key(first)
+
+
 def _read_key(fd: int) -> str:
+    if is_windows():
+        return _read_key_windows()
     raw = os.read(fd, 1)
     if not raw:
         raise EOFError("stdin closed")
@@ -3473,6 +3788,10 @@ class RawSession:
     canonical mode get line-buffered, so an escape sequence sent as ESC O C can
     be delivered as garbage (a down arrow reading as enter). one session, and a
     temporary hand-back only for cooked line edits.
+
+    windows consoles have no termios: msvcrt.getwch already returns keys
+    without waiting for enter and without echoing them, so the session only
+    tracks whether menus are live.
     """
 
     def __init__(self, fd: int = 0):
@@ -3482,6 +3801,9 @@ class RawSession:
 
     def enter(self) -> None:
         if self.active or not sys.stdin.isatty():
+            return
+        if is_windows():
+            self.active = True
             return
         import termios
         import tty
@@ -3493,9 +3815,10 @@ class RawSession:
         self.active = True
 
     def leave(self) -> None:
-        import termios
-        if self.active and self.saved is not None:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        if not is_windows():
+            import termios
+            if self.active and self.saved is not None:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
         self.active = False
 
     @contextmanager
@@ -3563,7 +3886,7 @@ def ask_yes_no(question: str, default: bool = False) -> bool:
             return default
         return raw[0] == "y"
 
-    tags = "y/n" if default else "y/N"
+    tags = "Y/n" if default else "y/N"
     sys.stdout.write(f"  {B}{question}{NC} {C_DIM}[{tags}]{NC} ")
     sys.stdout.flush()
     answer = default
@@ -3807,23 +4130,43 @@ def _select_numbered(crumb: str, items: list) -> object:
 # screens
 # ---------------------------------------------------------------------------
 
+def requirement_banner(reqs: list) -> str:
+    """one line for the menu header: all good, or what is missing."""
+    missing = missing_requirements(reqs)
+    total = sum(1 for req in reqs if req.required)
+    if not missing:
+        return ("  " + C_GRN + "\u2713" + NC + " " + B + "requirements" + NC
+                + "  " + C_GRN + f"all {total} installed" + NC)
+    return ("  " + C_RED + "\u2717" + NC + " " + B + "requirements" + NC + "  "
+            + C_RED + f"{len(missing)} of {total} missing" + NC + C_DIM + ": "
+            + ", ".join(req.label for req in missing)
+            + "  \u00b7 press c to install" + NC)
+
+
 def screen_main(tools: Tools, args) -> str:
     videos = len(scan_videos())
-    bits = ["ffmpeg ok" if tools.ffmpeg else "ffmpeg missing",
-            f"{videos} in input/", f"{count_renders()} in output/"]
+    reqs = check_requirements(tools)
+    missing = missing_requirements(reqs)
+    bits = [f"{videos} in input/", f"{count_renders()} in output/"]
     items = [
         Item("process a video", hint="pick a clip, build an effect chain, render",
              value="process"),
         Item("effects", hint="browse effect options and descriptions",
              value="effects"),
-        Item("system check", hint="ffmpeg, ffprobe, folders", value="check"),
+        Item("requirements",
+             hint="install what is missing" if missing
+             else "ffmpeg, ffprobe, python, optional modules", value="check"),
         Item("quit", hint="leave effex", value="quit"),
     ]
     intro = [
         B + C_FROST + "[SOURCE] -> [EFFECTS] -> [OUTPUT]" + NC,
         C_DIM + "pick a clip, shape a look, render it to output/" + NC,
         "",
+        requirement_banner(reqs),
     ]
+    if term_rows() >= 26:
+        intro += requirement_lines(reqs, term_cols() - 6)
+    intro.append("")
     note = "  ·  ".join(bits)
     if not videos:
         note = "input/ is empty \u00b7 " + note
@@ -3837,6 +4180,7 @@ def screen_main(tools: Tools, args) -> str:
                     jump={"p": 0, "e": 1, "c": 2, "q": 3},
                     intro=intro)
     return "quit" if picked is None else str(picked)
+
 
 
 def screen_help(args) -> None:
@@ -3895,22 +4239,19 @@ def screen_effects_info(args) -> None:
 
 def screen_check(tools: Tools, interactive: bool) -> Tools:
     width = term_cols() - 6
-    body = []
-    if tools.ffmpeg:
-        body.append("  " + C_GRN + "\u2713" + NC + " ffmpeg   " + C_DIM
-                    + trunc(tools.ffmpeg, width - 12) + NC)
-    else:
-        body.append("  " + C_RED + "\u2717" + NC + " ffmpeg   not on PATH")
-    if tools.ffprobe:
-        body.append("  " + C_GRN + "\u2713" + NC + " ffprobe  " + C_DIM
-                    + trunc(tools.ffprobe, width - 12) + NC)
-    else:
-        body.append("  " + C_AMB + "\u26a0" + NC + " ffprobe  missing, "
-                    "durations show as --:--")
-    if not tools.ok:
+    reqs = check_requirements(tools)
+    if missing_requirements(reqs):
         TERM.leave()
-        tools = install_ffmpeg(tools, interactive)
+        tools = install_requirements(tools, interactive)
         TERM.enter()
+        reqs = check_requirements(tools)
+    body = requirement_lines(reqs, width)
+    hint_line = pip_hint(reqs)
+    if hint_line:
+        body.append("")
+        body.append("  " + C_DIM
+                    + trunc("optional modules: " + hint_line, width) + NC)
+    body.append("")
     for folder in (INPUT_DIR, OUTPUT_DIR):
         folder.mkdir(parents=True, exist_ok=True)
         count = len(scan_videos(folder)) if folder == INPUT_DIR \
@@ -3918,7 +4259,8 @@ def screen_check(tools: Tools, interactive: bool) -> Tools:
         body.append("  " + C_GRN + "\u2713" + NC + " " + fit(folder.name, 8)
                     + C_DIM + trunc(str(folder), width - 24) + NC
                     + f"   {count} file{'' if count == 1 else 's'}")
-    start_frame("system check", body, ["enter back"])
+    start_frame("requirements", body, ["enter back"],
+                note=requirement_summary(reqs))
     wait_key()
     return tools
 
@@ -4388,6 +4730,12 @@ def screen_confirm(chain: Chain, clip: Clip, args, opts: dict) -> bool:
 
 def open_folder(path: Path) -> bool:
     """hand the folder to the desktop file manager; False when none exists"""
+    if is_windows():
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        except OSError:
+            return False
+        return True
     opener = shutil.which("xdg-open") or shutil.which("open")
     if not opener:
         return False
@@ -4410,6 +4758,9 @@ def screen_done(args, ok_render: bool) -> None:
             body += [""] + ["  " + C_DIM + line + NC for line in lines[-8:]]
         notice = C_RED + "render failed or was cancelled" + NC
         keys = ["enter main menu"]
+        if LOG.exists():
+            body += ["", kv("log", trunc(str(LOG.path()), term_cols() - 14))]
+            keys.append("l open log folder")
     else:
         speed = last_render.get("speed")
         body = [
@@ -4440,6 +4791,11 @@ def screen_done(args, ok_render: bool) -> None:
                 if open_folder(OUTPUT_DIR) \
                 else (C_AMB + "no file manager opener found - the folder "
                       f"is {OUTPUT_DIR}" + NC)
+        if key == "l" and LOG.exists():
+            folder = log_dir()
+            notice = (C_GRN + "opened " + str(folder) + NC) \
+                if open_folder(folder) \
+                else (C_AMB + f"the log is {LOG.path()}" + NC)
 
 
 # ---------------------------------------------------------------------------
@@ -4527,7 +4883,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list", action="store_true",
                    help="list effects with their options, and videos in input/")
     p.add_argument("--check", action="store_true",
-                   help="check ffmpeg/ffprobe and folders, exit 1 if missing")
+                   help="check ffmpeg/ffprobe/python and optional modules, "
+                        "exit 1 if something required is missing")
+    p.add_argument("--logs", action="store_true",
+                   help="print the diagnostics log path and its last lines")
+    p.add_argument("--report", nargs="?", const="", default=None, metavar="PATH",
+                   help="write a diagnostics report to attach to an issue")
     p.add_argument("--set", action="append", metavar="KEY=VALUE",
                    help="set an effect option, eg --set target=16:9")
     p.add_argument("--with", dest="second_video", metavar="VIDEO",
@@ -4634,16 +4995,57 @@ def cmd_list(args, tools: Tools) -> int:
     return 0
 
 
+def cmd_logs(args) -> int:
+    path = LOG.path()
+    _say("  " + B + C_FROST + "log" + NC + "  " + str(path))
+    if not path.is_file():
+        hint("nothing logged yet - warnings and errors get recorded here")
+        return 0
+    _say("")
+    for line in LOG.tail(40).splitlines():
+        _say("  " + C_DIM + line + NC)
+    _say("")
+    hint(f"attach this file to an issue: {ISSUES_URL}")
+    hint("--report writes one file with the environment header on top")
+    return 0
+
+
+def cmd_report(args) -> int:
+    destination = Path(args.report).expanduser() if args.report else None
+    try:
+        written = LOG.report(destination)
+    except OSError as exc:
+        err(f"could not write the report: {exc}")
+        return 1
+    ok(str(written))
+    hint(f"attach it to an issue: {ISSUES_URL}")
+    return 0
+
+
 def cmd_check(args, tools: Tools) -> int:
+    reqs = check_requirements(tools)
+    missing = missing_requirements(reqs)
     if args.json:
         # machine mode: one json object on stdout, nothing else
-        payload = {"ok": tools.ok, "ffmpeg": tools.ffmpeg,
-                   "ffprobe": tools.ffprobe}
-        if not tools.ok:
+        payload = {
+            "ok": not missing,
+            "ffmpeg": tools.ffmpeg,
+            "ffprobe": tools.ffprobe,
+            "platform": host_os(),
+            "requirements": [
+                {"key": r.key, "label": r.label, "required": r.required,
+                 "found": r.found, "detail": r.detail, "unlocks": r.unlocks}
+                for r in reqs
+            ],
+        }
+        if missing:
             hit = detect_installer()
-            payload["hint"] = " ".join(hit[1]) if hit else None
+            payload["installer"] = hit.manager if hit else None
+            payload["hint"] = (install_text(hit, [r.key for r in missing
+                                                  if r.installable])
+                               if hit else None)
         _say(json.dumps(payload))
-        return 0 if tools.ok else 1
+        return 0 if not missing else 1
     tools = screen_check(tools, interactive=sys.stdin.isatty())
     return 0 if tools.ok else 1
 
@@ -4754,6 +5156,7 @@ def cmd_run(args, tools: Tools) -> int:
 
 
 def main(argv=None) -> int:
+    prepare_console()
     parser = build_parser()
     args = parser.parse_args(argv)
     args.size_given = args.size is not None
@@ -4770,9 +5173,16 @@ def main(argv=None) -> int:
                        or not sys.stdout.isatty()))
     global _QUIET
     _QUIET = args.quiet
+    LOG.start(version=VERSION, argv=list(sys.argv[1:] if argv is None else argv))
 
     tools = find_tools()
+    LOG.bind("ffmpeg", tools.ffmpeg or "missing")
+    LOG.bind("ffprobe", tools.ffprobe or "missing")
 
+    if args.logs:
+        return cmd_logs(args)
+    if args.report is not None:
+        return cmd_report(args)
     if args.check:
         return cmd_check(args, tools)
     if args.list:
@@ -4802,20 +5212,37 @@ def main(argv=None) -> int:
     return interactive_menu(args)
 
 
+def venv_python_path(root: Path = ROOT,
+                     windows: Optional[bool] = None) -> Optional[str]:
+    """the venv interpreter for this platform, if the venv exists."""
+    if windows is None:
+        windows = is_windows()
+    names = ("Scripts", "python.exe") if windows else ("bin", "python3")
+    python = root / ".venv" / names[0] / names[1]
+    return str(python) if python.is_file() and os.access(python, os.X_OK) else None
+
+
 def project_python(root: Path = ROOT) -> Optional[str]:
     """Use local optional dependencies for plain launches, not active custom envs."""
     if sys.flags.no_site or sys.prefix != sys.base_prefix:
         return None
-    python = root / ".venv" / "bin" / "python3"
-    return str(python) if python.is_file() and os.access(python, os.X_OK) else None
+    return venv_python_path(root)
 
 
 if __name__ == "__main__":
     try:
         python = project_python()
         if python:
+            if is_windows():
+                # os.execv leaves no parent to report the exit code on windows
+                sys.exit(subprocess.call([python, str(Path(__file__).resolve()),
+                                          *sys.argv[1:]]))
             os.execv(python, [python, str(Path(__file__).resolve()), *sys.argv[1:]])
-        sys.exit(main())
+        code = main()
+        if code and LOG.wrote:
+            hint(f"details in {LOG.path()}  ·  --report writes a file "
+                 "to attach to an issue")
+        sys.exit(code)
     except BrokenPipeError:
         try:
             sys.stderr.close()
@@ -4825,3 +5252,13 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         _say()
         sys.exit(130)
+    except Exception as exc:
+        LOG.exception(exc)
+        try:
+            err(f"{type(exc).__name__}: {exc}")
+            if LOG.wrote:
+                hint(f"details in {LOG.path()}")
+            hint(f"please report it: {ISSUES_URL}")
+        except Exception:
+            pass
+        sys.exit(1)

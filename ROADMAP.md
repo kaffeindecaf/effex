@@ -772,7 +772,50 @@ problem.
   rows in place and keeps the cursor sane. the empty state also offers r, so a
   video dropped in while the menu is open shows up without a restart._
 - [ ] E4.7 - remember the last used effect and video for the session
-- [ ] E4.8 - README notes for windows and macos (the original script was windows-first)
+- [x] E4.8 - README notes for windows and macos (the original script was windows-first)
+  _Done 2026-10-28: README documents the windows launcher (`effex.cmd`), the
+  powershell installer, the per-platform venv interpreter path, and a
+  requirements section with one row per prerequisite and one row per package
+  manager (winget/choco/scoop, brew, apt, dnf, pacman, zypper, apk). macos runs
+  the same README steps as linux: `./install.sh` plus homebrew._
+- [x] E4.14 - requirements panel in the main menu and a one-answer install prompt
+  _Done 2026-10-28: every launch checks ffmpeg, ffprobe, python 3.8+ and the
+  optional numpy/opencv/PyAV modules, and the main menu header says either
+  `requirements all 3 installed` or `N of 3 missing: <names> · press c to
+  install`, with one row per requirement (path, version, or what it unlocks)
+  when the terminal is 26 rows or taller. Missing required binaries trigger
+  `install ffmpeg + ffprobe now? [Y/n]` before the menu opens: the installer is
+  picked from the host os (winget, chocolatey, scoop, homebrew, apt-get, dnf,
+  pacman, zypper, apk - none of the windows commands use sudo) and one command
+  covers both binaries because they share a package. Declining keeps the count
+  on screen and the `requirements` row (or c) asks again; answering yes runs the
+  commands, then re-probes, refreshes the windows PATH from the registry and
+  reports anything still missing. `--check` prints the same panel and exits 1
+  when something required is absent, `--check --json` adds `platform`,
+  `installer`, `hint` and a requirements array. Windows now has a runtime, not
+  just docs: msvcrt key reading (arrow/NUL+code decoding), a no-op raw session,
+  UTF-8 + VT console setup, os.startfile folder opening, the `Scripts\python.exe`
+  venv path and a subprocess re-exec instead of execv. verified: 29/29
+  install-prompt checks (including an ffprobe-only gap), 42/42 platform checks,
+  177/177 layout checks, full suite green._
+- [x] E4.15 - diagnostics log with every warning and error, made to attach to an issue
+  _Done 2026-10-28: `diagnostics.py` is a leaf module (no effex imports) holding
+  one per-user log file - `$XDG_STATE_HOME/effex/logs` on linux,
+  `~/Library/Logs/effex` on macos, `%LOCALAPPDATA%\effex\logs` on windows,
+  `EFFEX_LOG_DIR` overrides it. Only warnings, errors, ffmpeg stderr and
+  tracebacks are written, so a clean run creates no file at all. Each run opens
+  with a header (version, command, cwd, platform, python, ffmpeg/ffprobe paths
+  and probed versions); events are one line each with detail indented under
+  them, ANSI stripped, so grep works. Rotation at 512 KiB keeping 5 files,
+  a lock so render threads cannot interleave, and every write wrapped so a
+  broken log can never break a render. `err()`/`warn()` log automatically;
+  render failures attach ffmpeg's own stderr, `process()` logs tracebacks, and
+  `__main__` records anything that escapes. `--logs` prints the path and the
+  last 40 lines, `--report [PATH]` writes a single file (environment header +
+  200-line tail) for the issue tracker, and the failure screen shows the path
+  with an `l` key to open the folder. verified: 44/44 logging checks (record
+  format, rotation, threads, traceback, report, cli failure with real ffmpeg
+  stderr), full suite green._
 - [ ] E4.9 - optional single-file build (pyinstaller) for machines without python
 - [x] E4.10 - wide-terminal layout check
   _Done 2026-09-24: tests/layout.py runs the whole flow at 60x20, 80x24 and

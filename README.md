@@ -19,29 +19,60 @@ estimated finish.
 to put `effex` on your PATH:
 
 ```sh
-./install.sh
+./install.sh                                        # linux, macos
 ```
 
-needs Python 3.8+ and FFmpeg. `ffprobe` adds clip details and is required for two-video datamosh and stateful effects. The built-in filters use Python's standard library; temporal sediment also needs NumPy:
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1  # windows
+```
+
+on windows run `effex.cmd` (or `py effex.py`) - `.py` files are not executable
+there. the shim prefers `.venv\Scripts\python.exe` and falls back to `py -3`.
+
+## requirements
+
+`effex` checks these on every launch and shows the result in the main menu:
+
+| requirement | what it is for | installed with |
+| --- | --- | --- |
+| `ffmpeg` | renders every effect | the package manager below |
+| `ffprobe` | clip details, two-video datamosh, stateful effects | ships in the ffmpeg package |
+| python 3.8+ | runs effex | python.org |
+| `numpy` (optional) | sediment, collapse, inversion | `requirements-stateful.txt` |
+| `opencv` (optional) | elastic collapse seam detail | `requirements-collapse.txt` |
+| `PyAV` (optional) | inversion timestamps | `requirements-inversion.txt` |
+
+when a required binary is missing the menu asks `install ffmpeg + ffprobe now?`
+and runs the command for the platform it detected:
+
+| os | manager | command |
+| --- | --- | --- |
+| windows 10/11 | winget | `winget install -e --id Gyan.FFmpeg --accept-package-agreements --accept-source-agreements` |
+| windows | chocolatey / scoop | `choco install -y ffmpeg` / `scoop install ffmpeg` |
+| macos | homebrew | `brew install ffmpeg` |
+| debian, ubuntu, parrot, mint | apt | `sudo apt-get install -y ffmpeg` |
+| fedora, rhel | dnf | `sudo dnf install -y ffmpeg` |
+| arch, manjaro | pacman | `sudo pacman -S --noconfirm ffmpeg` |
+| opensuse | zypper | `sudo zypper install -y ffmpeg` |
+| alpine | apk | `sudo apk add ffmpeg` |
+
+answer n and the menu keeps the missing count visible; the `requirements` row
+(or `c`) asks again. `./effex.py --check` prints the same panel for scripts and
+exits 1 when something required is missing, `--check --json` reports it as json
+(`ok`, `platform`, `installer`, `hint`, and one object per requirement).
+
+the optional modules are never installed by that prompt - they are pip packages,
+loaded only when rendering stateful effects. Ordinary FFmpeg effects and
+`--list` still work without them:
 
 ```sh
 python3 -m pip install -r requirements-stateful.txt
-```
-
-Elastic collapse additionally uses headless OpenCV for optimized CPU remapping,
-resizing, blur and gradient analysis. Install it in your Python environment:
-
-```sh
 python3 -m pip install -r requirements-collapse.txt
 ```
 
-These packages are optional and loaded only when rendering stateful effects.
-Ordinary FFmpeg effects and `--list` still work without them.
-
-Causality inversion uses NumPy and PyAV to carry RGB frames with their original
-presentation timestamps. Install `requirements-inversion.txt`; its aligned mode
-also needs `requirements-collapse.txt` for CPU optical flow. Timestamped export
-uses FFmpeg's `-enc_time_base demux` option (tested with FFmpeg 7.1).
+Causality inversion needs PyAV on top of NumPy; its aligned mode also needs
+`requirements-collapse.txt` for CPU optical flow. Timestamped export uses
+FFmpeg's `-enc_time_base demux` option (tested with FFmpeg 7.1).
 
 For optional effects on systems with externally managed Python, use a local
 environment rather than installing into the system interpreter:
@@ -51,10 +82,11 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-collapse.txt -r requirements-inversion.txt
 ```
 
-Plain `./effex.py` and installed `effex` launches use `.venv/bin/python3` when
-present. An already-active virtual environment is respected; `python -S` keeps
-its explicit no-site behavior. Failed renders now keep the underlying error on
-the completion screen instead of showing only "no output file was written".
+on windows the interpreter is `.venv\Scripts\python.exe`. Plain `./effex.py`,
+`effex.cmd` and installed `effex` launches use the local venv when present. An
+already-active virtual environment is respected; `python -S` keeps its explicit
+no-site behavior. Failed renders keep the underlying error on the completion
+screen instead of showing only "no output file was written".
 
 ## commands
 
@@ -76,6 +108,38 @@ the completion screen instead of showing only "no output file was written".
 ```
 
 `--set key=value` changes an effect option. use `--size 1920x1080` for a shape, `--output path.mp4` for an exact path, and `--force` to overwrite. without `--force`, effex adds `_2`, `_3`, and so on instead of replacing a render.
+
+## when something breaks
+
+effex keeps a diagnostics log with every warning and error, plus the ffmpeg
+stderr that caused a failed render and the traceback of anything that crashed.
+a run that works writes nothing, so the file only holds the interesting bits.
+
+| os | log file |
+| --- | --- |
+| linux | `$XDG_STATE_HOME/effex/logs/effex.log` (`~/.local/state/effex/logs`) |
+| macos | `~/Library/Logs/effex/effex.log` |
+| windows | `%LOCALAPPDATA%\effex\logs\effex.log` |
+
+`EFFEX_LOG_DIR` points it somewhere else. the file rotates at 512 KiB and keeps
+five old copies (`effex.log.1` ... `.5`), so it never grows without bound.
+
+```sh
+./effex.py --logs              # print the path and the last 40 lines
+./effex.py --report            # one file: environment header + the log tail
+./effex.py --report issue.log  # same, at a path you choose
+```
+
+every log entry is one line (`2026-10-28 16:17:57 error ffmpeg failed (exit 183)`)
+with any detail indented under it, so `grep error` and issue searches work. the
+header of each run records the command, working directory, os, python, and the
+ffmpeg/ffprobe paths and versions - that is usually what a report needs. a failed
+render also shows the log path on the completion screen, where `l` opens the log
+folder.
+
+to report a bug: run `effex --report`, attach the file it writes to
+<https://github.com/kaffeindecaf/effex/issues/new>. skim it first - it contains
+your paths and file names.
 
 ## what it does
 
