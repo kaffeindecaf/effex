@@ -361,16 +361,136 @@ def main() -> int:
     proc = run([EFFEX, "blockswap", static, "--json"], env_extra=env)
     moved = Path(json.loads(proc.stdout.decode())["output"])
 
-    def frame_hash(path: Path, at: str) -> str:
+    def frame_bytes(path: Path, at: str) -> bytes:
         proc = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss",
                     at, "-i", str(path), "-frames:v", "1", "-f", "rawvideo",
                     "-pix_fmt", "rgb24", "-"])
-        return proc.stdout.hex()[:64]
+        return proc.stdout
 
-    h1, h2 = frame_hash(moved, "0.4"), frame_hash(moved, "2.2")
-    c.check("the blocks really travel (frames differ)",
-            h1 != h2, f"{h1} vs {h2}")
+    def mean_delta(left: bytes, right: bytes) -> float:
+        """Average per-channel difference; codec noise stays below ~1."""
+        if not left or len(left) != len(right):
+            return float("inf")
+        return sum(abs(a - b) for a, b in zip(left, right)) / len(left)
+
+    early, late = frame_bytes(moved, "0.4"), frame_bytes(moved, "2.2")
+    source_frame = frame_bytes(static, "1.0")
+    drift = mean_delta(early, late)
+    c.check("the blocks stay in place (only codec noise differs)",
+            drift < 2.0, f"mean delta {drift:.2f}")
+    c.check("blockswap really relocates the blocks",
+            mean_delta(source_frame, early) > 3.0,
+            f"mean delta {mean_delta(source_frame, early):.2f}")
     c.check("blockswap keeps the frame size", video_dims(moved) == (128, 128))
+
+    proc = run([EFFEX, "blockswap", static, "--set", "blocks=1", "--dry-run"],
+               env_extra=env)
+    one = proc.stdout.decode()
+    proc = run([EFFEX, "blockswap", static, "--set", "blocks=5", "--dry-run"],
+               env_extra=env)
+    five = proc.stdout.decode()
+    c.check("blockswap block count is selectable",
+            proc.returncode == 0 and one.count("swaprect=") == 1
+            and five.count("swaprect=") == 5,
+            f"one={one.count('swaprect=')} five={five.count('swaprect=')}")
+    chain_line = next((line.split("filter:", 1)[1].strip()
+                       for line in five.splitlines()
+                       if "filter:" in line), "")
+    if not chain_line:
+        chain_line = five.split("-vf ", 1)[-1].split(" -map", 1)[0]
+    c.check("blockswap has no time expression left",
+            chain_line and "sin(" not in chain_line
+            and "t/" not in chain_line, chain_line[-200:])
+    import re as _re
+    rects = [tuple(int(n) for n in m) for m in _re.findall(
+        r"swaprect=w=(\d+):h=(\d+):x1=(\d+):y1=(\d+):x2=(\d+):y2=(\d+)", five)]
+    boxes = [(x1, y1, w_, h_) for w_, h_, x1, y1, _x2, _y2 in rects] + \
+            [(_x2, _y2, w_, h_) for w_, h_, _x1, _y1, _x2, _y2 in rects]
+    overlaps = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1:]
+                if (a[0] < b[0] + b[2] and b[0] < a[0] + a[2]
+                    and a[1] < b[1] + b[3] and b[1] < a[1] + a[3])]
+    c.check("blockswap keeps its blocks from overlapping", not overlaps,
+            str(overlaps[:3]))
+    proc = run([EFFEX, "blockswap", static, "--set", "seed=7", "--dry-run"],
+               env_extra=env)
+    seeded = proc.stdout.decode()
+    proc = run([EFFEX, "blockswap", static, "--set", "seed=8", "--dry-run"],
+               env_extra=env)
+    c.check("the seeded block layout is reproducible and seed-dependent",
+            seeded != proc.stdout.decode()
+            and seeded == run([EFFEX, "blockswap", static, "--set", "seed=7",
+                               "--dry-run"], env_extra=env).stdout.decode())
+    for setting in ("blocks=0", "blocks=9", "size=4", "size=61"):
+        proc = run([EFFEX, "blockswap", static, "--set", setting,
+                    "--dry-run"], env_extra=env)
+        c.check(f"blockswap rejects {setting}", proc.returncode == 2,
+                proc.stderr.decode()[:160])
+
+    # ---- teleporting blocks + light codec mosh ------------------------
+    proc = run([EFFEX, "blockswap", static, "--set", "teleport=0",
+                "--dry-run"], env_extra=env)
+    c.check("teleport=0 keeps one static layout",
+            proc.returncode == 0 and "enable=" not in proc.stdout.decode(),
+            proc.stdout.decode()[-200:])
+    proc = run([EFFEX, "blockswap", clip, "--set", "blocks=2",
+                "--set", "teleport=1", "--dry-run"], env_extra=env)
+    windows = proc.stdout.decode()
+    c.check("blocks teleport on a timer",
+            proc.returncode == 0
+            and "enable='between(t,1,2)'" in windows
+            and windows.count("swaprect=") == 6,
+            str(windows.count("swaprect=")))
+    c.check("a new layout is drawn for each teleport window",
+            len({tuple(m) for m in _re.findall(
+                r"x1=(\d+):y1=(\d+):x2=(\d+):y2=(\d+)", windows)}) >= 4)
+
+    proc = run([EFFEX, "blockswap", clip, "--set", "mosh=40", "--dry-run"],
+               env_extra=env)
+    mult = proc.stdout.decode()
+    c.check("mosh switches blockswap to the codec pipeline",
+            proc.returncode == 0 and "mpeg4" in mult and "pass 2" in mult,
+            mult[-300:])
+    c.check("mosh strength is reported",
+            "mosh=40%" in mult and "light codec mosh" in mult, mult[-400:])
+    for setting in ("teleport=-1", "mosh=101", "mosh_grit=32", "mosh_hold=1"):
+        proc = run([EFFEX, "blockswap", clip, "--set", setting, "--dry-run"],
+                   env_extra=env)
+        c.check(f"blockswap rejects {setting}", proc.returncode == 2,
+                proc.stderr.decode()[:160])
+
+    proc = run([EFFEX, "blockswap+deepfry", clip, "--dry-run"], env_extra=env)
+    c.check("the codec mosh makes blockswap a separate render",
+            proc.returncode == 2 and b"multi-pass" in proc.stderr,
+            proc.stderr.decode()[:200])
+
+    mosh_env = dict(env)
+    proc = run([EFFEX, "blockswap", clip, "--set", "teleport=1", "--json",
+                "--preset", "ultrafast"], env_extra=mosh_env)
+    c.check("teleporting without mosh still renders", proc.returncode == 0,
+            proc.stderr.decode()[:300])
+    plain = Path(json.loads(proc.stdout.decode())["output"]) \
+        if proc.returncode == 0 else None
+
+    proc = run([EFFEX, "blockswap", clip, "--set", "teleport=1",
+                "--set", "mosh=40", "--json", "--preset", "ultrafast"],
+               env_extra=mosh_env)
+    c.check("a teleporting moshed render succeeds", proc.returncode == 0,
+            proc.stderr.decode()[:300])
+    if proc.returncode == 0 and plain is not None:
+        moshed = Path(json.loads(proc.stdout.decode())["output"])
+        codec = next(s["codec_name"] for s in ffprobe_streams(moshed)["streams"]
+                     if s["codec_type"] == "video")
+        c.check("the mosh render is the codec stream", codec == "mpeg4", codec)
+        c.check("mosh keeps every frame",
+                video_frames(moshed) == video_frames(clip),
+                f"{video_frames(moshed)} vs {video_frames(clip)}")
+        c.check("mosh keeps the audio and frame size",
+                audio_codec(moshed) == "aac" and video_dims(moshed) == (640, 360))
+        early = frame_bytes(moshed, "0.5")
+        # where the encoder puts keyframes varies with the ffmpeg build, so the
+        # gate is "beyond codec noise" (a noise-only delta stays under 2)
+        delta = mean_delta(frame_bytes(plain, "0.5"), early)
+        c.check("mosh really changes the picture", delta > 3.0, f"{delta:.2f}")
 
     proc = run([EFFEX, "dropout", clip, "--set", "chance=30", "--dry-run"],
                env_extra=env)
@@ -688,12 +808,12 @@ def main() -> int:
             "contrast=1.90" in qualified and
             bare.split("-vf ")[-1] == qualified.split("-vf ")[-1])
 
-    proc = run([EFFEX, "zoom+blockswap", clip, "--set", "speed=fast",
+    proc = run([EFFEX, "zoom+wobble", clip, "--set", "speed=fast",
                 "--dry-run"], env_extra=env)
     c.check("a shared key must be qualified", proc.returncode == 2)
     c.check("the ambiguity names both qualified forms",
             b"zoom.speed=..." in proc.stderr and
-            b"blockswap.speed=..." in proc.stderr, proc.stderr.decode()[:200])
+            b"wobble.speed=..." in proc.stderr, proc.stderr.decode()[:200])
 
     proc = run([EFFEX, "datamosh+deepfry", clip, "--dry-run"], env_extra=env)
     c.check("a multi-pass effect is refused in a chain",

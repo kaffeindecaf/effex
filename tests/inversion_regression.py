@@ -21,6 +21,64 @@ from harness import EFFEX, audio_codec, env_for, make_clip, run, video_dims
 
 
 class InversionTests(unittest.TestCase):
+    def test_done_screen_keeps_the_underlying_render_error(self):
+        import contextlib
+        import io
+        import effex
+        from types import SimpleNamespace
+        previous = dict(effex.last_render)
+        try:
+            effex.last_render.clear()
+            effex.last_render["error"] = "Causality Inversion needs requirements-inversion.txt (PyAV)"
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                effex.screen_done(SimpleNamespace(), False)
+            self.assertIn("requirements-inversion.txt", output.getvalue())
+            self.assertIn("PyAV", output.getvalue())
+        finally:
+            effex.last_render.clear()
+            effex.last_render.update(previous)
+
+    def test_plain_launch_selects_the_project_environment_only_when_needed(self):
+        import effex
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix="effex-python-") as directory:
+            root = Path(directory)
+            python = root / ".venv" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.write_text("#!/bin/sh\nexit 0\n")
+            python.chmod(0o755)
+            with patch.object(effex.sys, "prefix", sys.base_prefix):
+                self.assertEqual(effex.project_python(root), str(python))
+                with patch.object(effex.sys, "flags", SimpleNamespace(no_site=True)):
+                    self.assertIsNone(effex.project_python(root))
+            with patch.object(effex.sys, "prefix", "/some/active/venv"):
+                self.assertIsNone(effex.project_python(root))
+            python.unlink()
+            self.assertIsNone(effex.project_python(root))
+
+    def test_nominal_lookahead_adapts_to_the_memory_budget(self):
+        from stateful_effects import CausalityInversion
+        shape = (24, 32, 3)
+        p = CausalityInversion()
+        p.MAX_STATE_BYTES = 65536 + int(np.prod(shape)) * 3
+        p.initialize(dict(lookahead=0.5, offset=0.5, strength=100,
+                          mode="replace", feather=0), shape, 10, 17)
+        self.assertEqual(p.capacity, 3)
+        self.assertAlmostEqual(p.effective_lookahead, 0.2)
+        self.assertAlmostEqual(p.effective_offset, 0.2)
+        self.assertTrue(p.runtime_notes)
+        self.assertEqual(p.serialize_config()["offset"], 0.5)
+        output = []
+        for index in range(8):
+            output.extend(p.push(self.packet(np.full(shape, index * 10, np.uint8), index)))
+            self.assertLessEqual(p.state_nbytes, p.MAX_STATE_BYTES)
+        output.extend(p.flush())
+        self.assertEqual([item.index for item in output], list(range(8)))
+        self.assertEqual(int(output[0].frame[0, 0, 0]), 20)
+        self.assertEqual([item.timestamp for item in output], [Fraction(i, 10) for i in range(8)])
+
     def processor(self, shape=(24, 32, 3), seed=17, **config):
         self.assertTrue(hasattr(stateful_effects, "CausalityInversion"),
                         "CausalityInversion must be implemented")
@@ -154,8 +212,10 @@ class InversionTests(unittest.TestCase):
         output.extend(p.flush())
         self.assertEqual([q.index for q in output], list(range(100)))
         self.assertEqual(p.state_nbytes, 0)
+        high_res = self.processor(shape=(2160, 3840, 3), lookahead=1, offset=1)
+        self.assertLess(high_res.effective_lookahead, 1)
         with self.assertRaisesRegex(ValueError, "budget"):
-            self.processor(shape=(2160, 3840, 3), lookahead=1, offset=1)
+            self.processor(shape=(10000, 10000, 3), lookahead=1, offset=1)
         with self.assertRaisesRegex(ValueError, "offset"):
             self.processor(lookahead=0.1, offset=0.5)
 
@@ -206,6 +266,22 @@ class InversionTests(unittest.TestCase):
             output = list(process_packets(iter(packets), stages))
             self.assertEqual([q.timestamp for q in output], [q.timestamp for q in packets])
             self.assertEqual(len(output), len(packets))
+
+    @unittest.skipUnless(importlib.util.find_spec("av"), "install requirements-inversion.txt")
+    def test_default_inversion_renders_high_resolution_instead_of_refusing(self):
+        with tempfile.TemporaryDirectory(prefix="effex-large-inversion-") as directory:
+            root = Path(directory)
+            clip = root / "large.mp4"
+            self.assertTrue(make_clip(clip, seconds=0.3, size="2560x1440", audio=False))
+            proc = run([EFFEX, "inversion", clip, "--json", "--preset", "ultrafast"],
+                       env_extra=env_for(root, root / "out"), timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+            data = json.loads(proc.stdout)
+            self.assertEqual(video_dims(data["output"]), (2560, 1440))
+            self.assertTrue(any("buffer budget" in note for note in data.get("warnings", [])))
+            probe = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=nb_frames", "-of", "json", data["output"]])
+            self.assertEqual(int(json.loads(probe.stdout)["streams"][0]["nb_frames"]), 9)
 
     @unittest.skipUnless(importlib.util.find_spec("av"), "install requirements-inversion.txt")
     def test_real_cli_preserves_vfr_pts_and_render_modes(self):

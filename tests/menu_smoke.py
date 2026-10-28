@@ -418,6 +418,15 @@ def scenario_datamosh(c: Checker):
     c.check("the hold row is shown", "hold" in d.text())
     c.check("no preview key on a two-pass effect",
             "p preview" not in d.text())
+    d.send(DOWN)                                  # mosh preset
+    press_and_wait(d, RIGHT)                      # standard
+    c.check("standard preset loads its codec knobs in the menu",
+            "standard" in last_frame(d) and "150" in last_frame(d),
+            last_frame(d))
+    press_and_wait(d, LEFT)                       # heavy
+    c.check("heavy preset reloads the aggressive codec knobs",
+            "heavy" in last_frame(d) and "150" not in last_frame(d)
+            and "motion bloom" in last_frame(d), last_frame(d))
     d.send(b"r")
     c.check("confirm screen opens", d.wait_for("render this video?"))
     d.send(ENTER)
@@ -459,7 +468,7 @@ def scenario_datamosh_second(c: Checker):
     c.check("confirm shows the two-source datamosh plan",
             d.wait_for("render this video?") and
             "WITH_bbb" in last_frame(d) and
-            "mpeg4" in last_frame(d) and "gop 150" in last_frame(d),
+            "mpeg4" in last_frame(d) and "gop 12" in last_frame(d),
             last_frame(d)[-300:])
     d.send(ENTER)
     c.check("the combined datamosh renders from the menu",
@@ -885,6 +894,96 @@ def scenario_collapse(c: Checker):
             d.close()
 
 
+def scenario_blockswap(c: Checker):
+    """Teleport and mosh controls are reachable and the effect renders alone."""
+    in_dir, out_dir = temp_folders()
+    make_clip(in_dir / "clip.mp4", seconds=1, size="160x96")
+    d = start(env_for(in_dir, out_dir))
+    try:
+        d.wait_for("main menu")
+        d.send(b"p")
+        d.wait_for("pick a video")
+        d.send(ENTER)
+        d.wait_for("pick an effect")
+        next_effect_group(d, 3)                 # codec & blocks group
+        d.send(DOWN * 1)                        # blockswap, after datamosh
+        d.send(ENTER)
+        c.check("blockswap options open", wait_last(d, "blockswap options"))
+        c.check("blockswap exposes teleport and mosh controls", all(
+            label in last_frame(d) for label in
+            ("blocks", "teleport secs", "mosh strength", "mosh grit", "mosh hold")))
+        c.check("blockswap is a separate render - no preview",
+                "p preview" not in last_frame(d))
+        for _ in range(2):
+            press_and_wait(d, DOWN)             # onto teleport secs
+        press_and_wait(d, RIGHT)
+        c.check("teleport is editable in the menu", "3.5" in last_frame(d),
+                last_frame(d)[-300:])
+        d.send(b"r")
+        c.check("blockswap confirm opens", wait_last(d, "render this video?"))
+        d.send(ENTER)
+        c.check("blockswap menu render finishes", wait_last(d, "wrote", timeout=30))
+        from harness import newest_mp4
+        output = newest_mp4(out_dir)
+        c.check("blockswap menu render keeps the frame",
+                output is not None and video_dims(output) == (160, 96))
+        d.send(ENTER)
+        wait_last(d, "main menu")
+        d.send(b"q")
+        c.check("blockswap exits cleanly", d.expect_exit(6) == 0)
+    finally:
+        d.close()
+
+
+def scenario_collapse_pixelate(c: Checker):
+    """Pixelation is an on/off switch on the collapse options screen."""
+    import importlib.util
+    import re
+    if importlib.util.find_spec("cv2") is None or importlib.util.find_spec("numpy") is None:
+        print("  SKIP collapse pixelate tests need requirements-collapse.txt")
+        return
+
+    def value_of(frame, label):
+        for line in frame.splitlines():
+            bare = line.strip()
+            if bare.startswith(label):
+                parts = re.split(r"\s{2,}", bare)
+                return parts[1] if len(parts) > 1 else ""
+        return ""
+
+    in_dir, out_dir = temp_folders()
+    make_clip(in_dir / "clip.mp4", seconds=1, size="160x90")
+    d = start(env_for(in_dir, out_dir))
+    try:
+        d.wait_for("main menu")
+        d.send(b"p")
+        d.wait_for("pick a video")
+        d.send(ENTER)
+        d.wait_for("pick an effect")
+        d.send(b"8")                            # collapse
+        c.check("collapse pixelate: options open", wait_last(d, "collapse options"))
+        c.check("collapse pixelate: off by default",
+                value_of(last_frame(d), "pixelate") == "off",
+                value_of(last_frame(d), "pixelate"))
+        d.send(DOWN * 11)                       # intensity .. pixelate
+        d.pump(0.5)
+        d.send(ENTER)
+        d.pump(0.4)
+        c.check("collapse pixelate: enter switches it on",
+                value_of(last_frame(d), "pixelate") == "on",
+                value_of(last_frame(d), "pixelate"))
+        d.send(ENTER)
+        d.pump(0.4)
+        c.check("collapse pixelate: enter switches it off again",
+                value_of(last_frame(d), "pixelate") == "off",
+                value_of(last_frame(d), "pixelate"))
+        for _ in range(4):
+            d.send(b"q")
+        c.check("collapse pixelate: exits cleanly", d.expect_exit(6) == 0)
+    finally:
+        d.close()
+
+
 def scenario_inversion(c: Checker):
     """Buffered future borrowing has editable controls and uses the same renderer."""
     import importlib.util
@@ -926,6 +1025,57 @@ def scenario_inversion(c: Checker):
         d.close()
 
 
+def scenario_archaeology(c: Checker):
+    """Future-cut controls stay editable and render through the shared pipeline."""
+    import importlib.util
+    from harness import newest_mp4
+    if importlib.util.find_spec("numpy") is None:
+        print("  SKIP archaeology menu tests need requirements-stateful.txt")
+        return
+    in_dir, out_dir = temp_folders()
+    make_clip(in_dir / "clip.mp4", seconds=1, size="160x96")
+    d = start(env_for(in_dir, out_dir))
+    try:
+        d.wait_for("main menu")
+        d.send(b"p")
+        d.wait_for("pick a video")
+        d.send(ENTER)
+        d.wait_for("pick an effect")
+        next_effect_group(d, 2)
+        d.send(DOWN * 5)
+        d.send(ENTER)
+        c.check("pixel archaeology options open", wait_last(d, "archaeology options"))
+        c.check("archaeology exposes buffer, cutout and melt controls", all(
+            label in last_frame(d) for label in
+            ("look-ahead s", "donor gap", "cutout size", "spawn every",
+             "hold frames", "melt frames")))
+        d.send(b"6")
+        press_and_wait(d, RIGHT)
+        c.check("archaeology pick mode is editable", "dissimilar" in last_frame(d))
+        d.send(DOWN * 5)
+        press_and_wait(d, RIGHT)
+        c.check("archaeology seam blend is editable", "none" in last_frame(d))
+        c.check("archaeology hides unsupported previews", "p preview" not in last_frame(d))
+        d.send(b"1")
+        press_and_wait(d, RIGHT)
+        c.check("archaeology look-ahead is editable", "0.7" in last_frame(d),
+                last_frame(d)[-300:])
+        d.send(b"r")
+        c.check("archaeology confirm opens", wait_last(d, "render this video?"))
+        d.send(ENTER)
+        c.check("archaeology menu render finishes", wait_last(d, "wrote", timeout=30))
+        output = newest_mp4(out_dir)
+        c.check("archaeology menu render preserves dimensions and audio",
+                output is not None and video_dims(output) == (160, 96)
+                and audio_codec(output) == "aac")
+        d.send(ENTER)
+        wait_last(d, "main menu")
+        d.send(b"q")
+        c.check("archaeology exits cleanly", d.expect_exit(6) == 0)
+    finally:
+        d.close()
+
+
 def main() -> int:
     c = Checker("menu smoke")
     if not require_tools(c):
@@ -937,7 +1087,9 @@ def main() -> int:
                      scenario_vhs, scenario_channelswap,
                      scenario_timescratch, scenario_temporal_sediment,
                      scenario_chain, scenario_psychedelic, scenario_collapse,
-                     scenario_inversion, scenario_backout):
+                     scenario_collapse_pixelate, scenario_blockswap,
+                     scenario_inversion,
+                     scenario_archaeology, scenario_backout):
         print(f"  -- {scenario.__name__}")
         scenario(c)
     return c.summary()

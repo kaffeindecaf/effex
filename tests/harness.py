@@ -47,11 +47,18 @@ class Checker:
 
 def run(args, stdin: bytes = b"", env_extra: Optional[dict] = None,
         timeout: int = 300, cwd=None):
-    """run effex (or anything) with a piped, non-tty stdin"""
+    """run effex (or anything) with a piped, non-tty stdin.
+
+    windows cannot execute a .py file directly (no shebang support), so the
+    interpreter is put in front there; on unix the shebang path stays tested
+    """
+    argv = [str(a) for a in args]
+    if os.name == "nt" and argv and argv[0].lower().endswith(".py"):
+        argv = [sys.executable] + argv
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
-    proc = subprocess.run([str(a) for a in args], input=stdin, env=env,
+    proc = subprocess.run(argv, input=stdin, env=env,
                           capture_output=True, timeout=timeout,
                           cwd=str(cwd or REPO))
     return proc
@@ -69,7 +76,7 @@ def temp_folders(prefix: str = "effex-test-"):
 
 def env_for(in_dir, out_dir) -> dict:
     return {"EFFEX_INPUT_DIR": str(in_dir), "EFFEX_OUTPUT_DIR": str(out_dir),
-            "NO_COLOR": "1"}
+            "EFFEX_LOG_DIR": str(Path(in_dir).parent / "logs"), "NO_COLOR": "1"}
 
 
 def make_clip(path: Path, seconds: float = 3, size: str = "640x360",
@@ -113,6 +120,16 @@ def audio_codec(path):
 def newest_mp4(folder) -> Optional[Path]:
     files = [p for p in Path(folder).glob("*.mp4")]
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
+
+
+def video_frames(path) -> int:
+    result = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                  "-show_entries", "stream=nb_frames", "-of", "csv=p=0",
+                  str(path)])
+    try:
+        return int(result.stdout.decode().strip() or 0)
+    except ValueError:
+        return 0
 
 
 def skip(message: str) -> int:

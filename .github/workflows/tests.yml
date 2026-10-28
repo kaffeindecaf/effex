@@ -23,6 +23,47 @@ jobs:
           sudo apt-get install -y ffmpeg
           python -m pip install -r requirements-collapse.txt -r requirements-inversion.txt ruff
       - name: check changed processor code
-        run: ruff check --select F frame_pipeline.py timestamped_frames.py stateful_effects.py tests/inversion_regression.py
+        run: ruff check --select F frame_pipeline.py timestamped_frames.py stateful_effects.py tests/inversion_regression.py tests/platform_support.py tests/install_prompt.py tests/logging_regression.py
       - name: run every suite with optional dependencies present
         run: python tests/run_tests.py
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: make sure ffmpeg and ffprobe are on PATH
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+          }
+          ffmpeg -version | Select-Object -First 1
+          ffprobe -version | Select-Object -First 1
+      - name: platform + installer tables
+        shell: pwsh
+        run: |
+          python tests/platform_support.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: diagnostics log
+        shell: pwsh
+        run: |
+          python tests/logging_regression.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: cli regression
+        shell: pwsh
+        run: |
+          python tests/cli_regression.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: requirement check on windows
+        shell: pwsh
+        run: |
+          python -c "import diagnostics, os; p = diagnostics.log_dir(); print(p); assert 'effex' in str(p).lower() and os.environ['LOCALAPPDATA'].lower() in str(p).lower(), p"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python effex.py --check --json
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python effex.py --list
+          if ($LASTEXITCODE -ne 0) { exit 1 }

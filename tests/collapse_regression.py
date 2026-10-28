@@ -177,6 +177,44 @@ class CollapseTests(unittest.TestCase):
                           ("intensity", "horizontal", "vertical", "seam_strength")],
                          [100, 100, 100, 100])
         self.assertEqual((defaults["block_size"], defaults["mosh"]), (4, 60))
+        self.assertIs(defaults["pixelate"], False)
+        self.assertIs(stateful_effects.ElasticCollapse.DEFAULTS["pixelate"], False)
+
+    def test_pixelation_is_opt_in_and_off_by_default(self):
+        y, x = np.indices((64, 96))
+        smooth = np.stack((x * 255 // 95, y * 255 // 63, (x + y) * 255 // 158),
+                          axis=-1).astype(np.uint8)
+
+        def run_lengths(processor):
+            out = processor.process(smooth, 0, 0.0, {})
+            row = out[32]
+            runs, current = [], 1
+            for left, right in zip(row, row[1:]):
+                if np.array_equal(left, right):
+                    current += 1
+                else:
+                    runs.append(current)
+                    current = 1
+            runs.append(current)
+            return float(np.median(runs)), len(runs)
+
+        clean = self.processor(mode="seam", preserve=0, _clip_duration=1)
+        blocky = self.processor(mode="seam", preserve=0, _clip_duration=1,
+                                pixelate=True, block_size=4, mosh=0)
+        clean_run, clean_edges = run_lengths(clean)
+        blocky_run, blocky_edges = run_lengths(blocky)
+        self.assertLessEqual(clean_run, 2, "default output must not be blocky")
+        self.assertGreaterEqual(blocky_run, 3, "pixelate=on must produce blocks")
+        self.assertGreater(clean_edges, blocky_edges * 1.8,
+                           f"clean={clean_edges} blocky={blocky_edges}")
+
+        # Block knobs are inert while pixelation is off.
+        for settings in ({"block_size": 1, "mosh": 0},
+                         {"block_size": 16, "mosh": 100}):
+            other = self.processor(mode="seam", preserve=0, _clip_duration=1,
+                                   **settings)
+            np.testing.assert_array_equal(clean.process(smooth, 0, 0.0, {}),
+                                          other.process(smooth, 0, 0.0, {}))
 
     def test_seam_mode_is_distinct_and_zero_strength_disables_it(self):
         frame = self.frame()
@@ -228,8 +266,10 @@ class CollapseTests(unittest.TestCase):
         y, x = np.indices((64, 96))
         checker = (((x + y) % 2) * 255).astype(np.uint8)
         frame = np.repeat(checker[:, :, None], 3, axis=2)
-        fine = self.processor(mode="seam", block_size=1, mosh=0, preserve=0)
-        chunky = self.processor(mode="seam", block_size=4, mosh=0, preserve=0)
+        fine = self.processor(mode="seam", pixelate=True, block_size=1, mosh=0,
+                              preserve=0)
+        chunky = self.processor(mode="seam", pixelate=True, block_size=4, mosh=0,
+                                preserve=0)
         fine_out = fine.process(frame, 0, 0.0, {})
         chunky_out = chunky.process(frame, 0, 0.0, {})
         fine_edges = np.count_nonzero(np.diff(fine_out[32, :, 0]))
@@ -246,7 +286,7 @@ class CollapseTests(unittest.TestCase):
 
         def run(mosh):
             processor = self.processor(
-                mode="seam", block_size=4, mosh=mosh, preserve=0,
+                mode="seam", pixelate=True, block_size=4, mosh=mosh, preserve=0,
                 coherence=0, _clip_duration=1,
             )
             processor.process(before, 0, 0.0, {})
@@ -258,7 +298,8 @@ class CollapseTests(unittest.TestCase):
         self.assertGreater(float(np.abs(carried.astype(float) - clean).mean()), 2)
 
         def run_static(mosh):
-            processor = self.processor(mode="seam", block_size=4, mosh=mosh)
+            processor = self.processor(mode="seam", pixelate=True,
+                                       block_size=4, mosh=mosh)
             processor.process(before, 0, 0.0, {})
             return processor.process(before, 1, 1 / 30, {})
 
@@ -340,7 +381,7 @@ class CollapseTests(unittest.TestCase):
                             "preserve=101", "mode=unknown", "seam_strength=101",
                             "motion=-1", "smoothness=101", "speed=-1", "speed=5",
                             "block_size=0", "block_size=17", "mosh=-1", "mosh=101",
-                            "coherence=101", "seed=-1"):
+                            "coherence=101", "seed=-1", "pixelate=maybe"):
                 with self.subTest(invalid=setting):
                     proc = run([EFFEX, "collapse", clip, "--set", setting,
                                 "--dry-run"], env_extra=env)
@@ -368,6 +409,25 @@ class CollapseTests(unittest.TestCase):
                                       if s["codec_type"] == "video")
                         self.assertEqual(int(stream["nb_frames"]), 30)
                         self.assertAlmostEqual(float(stream["duration"]), 1, delta=0.05)
+
+            # Pixelation is a real switch, not just a config field.
+            outputs = {}
+            for pixelate in ("off", "on"):
+                args = [EFFEX, "collapse", clip, "--set", "mode=seam",
+                        "--set", f"pixelate={pixelate}", "--set", "preserve=0",
+                        "--json", "--preset", "ultrafast",
+                        "--output", str(out_dir / f"pixelate-{pixelate}.mp4")]
+                proc = run(args, env_extra=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+                data = json.loads(proc.stdout)
+                self.assertIs(data["options"]["pixelate"], pixelate == "on")
+                decoded = run(["ffmpeg", "-v", "error", "-i", data["output"],
+                               "-frames:v", "1", "-f", "rawvideo",
+                               "-pix_fmt", "rgb24", "-"])
+                self.assertEqual(decoded.returncode, 0, decoded.stderr.decode())
+                outputs[pixelate] = np.frombuffer(decoded.stdout, np.uint8)
+            self.assertFalse(np.array_equal(outputs["off"], outputs["on"]),
+                             "the off render must not be pixelated")
 
     def test_optional_dependency_error_and_stdlib_import(self):
         from unittest.mock import patch
