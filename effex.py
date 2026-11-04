@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,7 @@ from typing import Callable, Optional, cast
 
 from stateful_effects import CausalityInversion, ElasticCollapse, TemporalSediment
 from future_cut import FutureCut
+from raster_slip import RasterSlip
 from diagnostics import ISSUES_URL, LOG, log_dir
 
 VERSION = "0.16.0"
@@ -349,7 +351,7 @@ def prepare_console() -> None:
 # ---------------------------------------------------------------------------
 
 OPTIONAL_MODULES = [
-    ("numpy", "sediment, collapse, inversion", "requirements-stateful.txt"),
+    ("numpy", "sediment, collapse, inversion, archaeology, raster slip", "requirements-stateful.txt"),
     ("cv2", "collapse seam detail", "requirements-collapse.txt"),
     ("av", "inversion timestamps", "requirements-inversion.txt"),
 ]
@@ -1232,6 +1234,27 @@ DATAMOSH_PARAMS = (
               ("heavy", "heavy", "crushed encode, no recovery frames, repeated motion bursts"),
               ("standard", "standard", "classic keyframe removal without motion blooming"),
           )),
+    Param("algorithm", "algorithm", "choose how the footage is moshed; presets tune the codec",
+          "choice", "classic", choices=(
+              ("classic", "classic", "melt one video or append a second video"),
+              ("self", "self-mosh", "cut this video into segments and melt their joins"),
+              ("shuffle", "cut shuffle", "scramble this video's segments and melt the new joins"),
+              ("pulse", "bloom pulses", "burst into repeated motion, then recover to clean footage"),
+          )),
+    Param("pulse_interval", "pulse interval", "bloom pulses: seconds between the starts of bursts",
+          "float", 2.0, minimum=0.1, maximum=3600.0, step=0.1),
+    Param("pulse_length", "pulse length", "bloom pulses: seconds per burst; 0 disables, leave a clean gap",
+          "float", 0.5, minimum=0.0, maximum=60.0, step=0.05),
+    Param("pulse_start", "first pulse", "bloom pulses: seconds of clean footage before the first burst",
+          "float", 1.0, minimum=0.0, maximum=3600.0, step=0.1),
+    Param("cut_length", "cut length", "self/shuffle: seconds per segment, rounded to whole frames",
+          "float", 2.0, minimum=0.1, maximum=60.0, step=0.1),
+    Param("segments", "segments", "self/shuffle: 0 uses the whole clip; otherwise select this many spaced cuts",
+          "int", 0, minimum=0, maximum=128, step=1),
+    Param("transition", "mosh transition", "self/shuffle: seconds of melt after each cut; 0 makes clean cuts",
+          "float", 0.75, minimum=0.0, maximum=60.0, step=0.05),
+    Param("reverse", "reverse chance", "self/shuffle: chance each segment plays backward, including its audio",
+          "percent", 0, minimum=0, maximum=100, step=5),
     Param("second_start", "second start", "seconds into the second video",
           "float", 0.0, minimum=0.0, maximum=3600.0, step=0.5),
     Param("second_length", "second length", "seconds to use; 0 means to the end",
@@ -1282,6 +1305,51 @@ def build_datamosh(ctx: EffectContext) -> Plan:
     second = str(opts.get("second", "none"))
     width, height = _source_dims(ctx.clip, ctx.frame)
     suffix = "_DATAMOSHED"
+    if opts.get("algorithm") == "pulse":
+        from datamosh_stream import pulse_ranges
+        fps = _fps_number(ctx.clip)
+        notes = ["bloom pulses: repeat prediction data inside timed bursts, then recover cleanly",
+                 "presets tune grit, fill and motion bloom; pulse timing sets the clean gaps",
+                 "source order and soundtrack stay intact; timing uses the source frame rate"]
+        try:
+            windows = pulse_ranges(ctx.clip.duration or 0, fps,
+                                   float(opts.get("pulse_interval", 2)),
+                                   float(opts.get("pulse_length", .5)),
+                                   float(opts.get("pulse_start", 1)))
+            notes.append(f"{len(windows)} bursts; pulse windows (seconds): " +
+                         (", ".join(f"{a / fps:g}-{b / fps:g}" for a, b in windows) or "none"))
+        except ValueError as exc:
+            notes.append(str(exc))
+        return Plan(vf="bloom pulses: MPEG-4 encode -> timed motion bursts -> clean recovery -> remux",
+                    out_suffix=ctx.suffix or "_PULSE_MOSHED", width=width, height=height,
+                    notes=notes)
+    if opts.get("algorithm", "classic") in ("self", "shuffle"):
+        from datamosh_stream import self_mosh_segments, transition_ranges
+        shuffled = opts.get("algorithm") == "shuffle"
+        name = "cut shuffle" if shuffled else "self-mosh"
+        notes = [f"{name}: cut this video into segments, then melt each join",
+                 "presets tune grit, fill and motion bloom; cut depth, survival and hold apply to classic",
+                 "auto audio follows the cuts and reversals; first keeps the original soundtrack"]
+        try:
+            fps = _fps_number(ctx.clip)
+            seed = int(opts.get("seed", 0)) or (20260925 + ctx.clip.size % 10000)
+            segments = self_mosh_segments(
+                ctx.clip.duration or 0, fps, float(opts.get("cut_length", 2)),
+                int(opts.get("segments", 0)), int(opts.get("reverse", 0)), seed, shuffle=shuffled)
+            windows = transition_ranges(segments, fps, float(opts.get("transition", .75)))
+            notes.append(f"{len(segments)} segments, {sum(s[2] for s in segments)} reversed, "
+                         f"{sum(s[1] for s in segments) / fps:g}s output")
+            notes.append(f"{opts.get('transition', .75):g}s transitions, capped at each segment's length")
+            notes.append("cuts (source seconds): " + ", ".join(
+                f"{start / fps:g}-{(start + frames) / fps:g}" + (" reverse" if rev else "")
+                for start, frames, rev in segments))
+            notes.append(f"{len(windows)} codec melt windows; clean recovery frames end each window")
+        except ValueError as exc:
+            notes.append(str(exc))
+        return Plan(vf=f"{name}: segment cuts/reversals -> MPEG-4 join melts -> remux",
+                    out_suffix=ctx.suffix or ("_SHUFFLE_MOSHED" if shuffled else "_SELF_MOSHED"),
+                    width=width, height=height,
+                    notes=notes)
     if second.lower() not in ("", "none", "off"):
         second_stem = Path(second).stem
         safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", second_stem).strip("._")
@@ -1321,7 +1389,7 @@ def build_datamosh(ctx: EffectContext) -> Plan:
 
 def strip_ivops(raw: bytes, cut: str, fill: str, seed: int,
                 survival: int = 25, bloom: int = 1,
-                bloom_window: int = 1) -> bytes:
+                bloom_window: int = 1, active_ranges=None) -> bytes:
     """cut i-vops out of an mpeg4 part 2 (m4v) bitstream.
 
     cut: heavy keeps only the first i-vop, medium every 2nd, light every
@@ -1331,7 +1399,7 @@ def strip_ivops(raw: bytes, cut: str, fill: str, seed: int,
     count and the audio sync survive the cut. Bloom reuses prediction data
     across existing frame slots, preserving their MPEG-4 time headers."""
     from bisect import bisect_left
-    from datamosh_stream import bloom_pvops, clock_bits, retime_vop
+    from datamosh_stream import bloom_pvops, clock_bits, clock_end, hold_vop, retime_vop
 
     time_width = clock_bits(raw)
     sc = b"\x00\x00\x01"
@@ -1357,13 +1425,23 @@ def strip_ivops(raw: bytes, cut: str, fill: str, seed: int,
     rng = random.Random(seed)
     survival = max(0, min(100, int(survival)))
     pvops = [idx for idx, unit in enumerate(units) if ctype(unit) == 1]
+    compatible_pvops = {}
+    if active_ranges is not None:
+        for idx in pvops:
+            compatible_pvops.setdefault(clock_end(units[idx], time_width), []).append(idx)
     drop = set()
     ivops = 0
+    frame = -1
     for idx, unit in enumerate(units):
+        if ctype(unit) >= 0:
+            frame += 1
         if ctype(unit) != 0:
             continue
         ivops += 1
         if ivops == 1:
+            continue
+        elif active_ranges is not None and not any(
+                a <= frame < b for a, b in active_ranges):
             continue
         elif cut == "medium":
             if (ivops - 1) % 2 != 0:
@@ -1398,16 +1476,23 @@ def strip_ivops(raw: bytes, cut: str, fill: str, seed: int,
         if not pvops:
             out += unit  # an all-keyframe clip has no prediction data to borrow
             continue
-        position = bisect_left(pvops, idx)
+        # A rollover changes the unary clock length. For timed joins, choose a
+        # compatible donor so the safety fallback cannot restore an early I-VOP.
+        pool = (compatible_pvops.get(clock_end(unit, time_width), [])
+                if active_ranges is not None else pvops)
+        if not pool:
+            out += hold_vop(unit, time_width)
+            continue
+        position = bisect_left(pool, idx)
         if fill == "next":
-            donor_idx = pvops[min(position, len(pvops) - 1)]
+            donor_idx = pool[min(position, len(pool) - 1)]
         elif fill == "prev":
-            donor_idx = pvops[max(0, position - 1)]
+            donor_idx = pool[max(0, position - 1)]
         else:                                    # chaos
-            donor_idx = rng.choice(pvops)
+            donor_idx = rng.choice(pool)
         donor = units[donor_idx]
         out += retime_vop(donor, unit, time_width)
-    return bloom_pvops(bytes(out), bloom, bloom_window)
+    return bloom_pvops(bytes(out), bloom, bloom_window, active_ranges)
 
 
 def resolve_second_video(raw: object, input_dir: Path,
@@ -1501,10 +1586,163 @@ def run_blockswap(ctx: EffectContext, clip: Clip, tools: Tools, args,
             pass
 
 
+def run_self_datamosh(ctx: EffectContext, clip: Clip, tools: Tools, args,
+                     dst: Path, run_encode, on_progress, animate) -> tuple:
+    """Prepare bounded lossless cuts, encode one clock, and mosh only joins."""
+    from datamosh_stream import self_mosh_segments, transition_ranges
+    from fractions import Fraction
+
+    opts = ctx.opts
+    fps = _fps_number(clip)
+    rate = str(Fraction(fps).limit_denominator(1001))
+    seed = int(opts.get("seed", 0)) or (20260925 + clip.size % 10000)
+    try:
+        segments = self_mosh_segments(
+            clip.duration or 0, fps, float(opts.get("cut_length", 2)),
+            int(opts.get("segments", 0)), int(opts.get("reverse", 0)), seed,
+            shuffle=opts.get("algorithm") == "shuffle")
+    except ValueError as exc:
+        return False, str(exc), 0.0
+    windows = transition_ranges(segments, fps, float(opts.get("transition", .75)))
+    total_frames = sum(frames for _, frames, _ in segments)
+    duration = total_frames / fps
+    audio = bool(clip.audio) and opts.get("audio", "auto") != "none"
+    elapsed, errors = 0.0, []
+
+    def encode(cmd, seconds):
+        nonlocal elapsed
+        rc, stderr, took = run_encode(cmd, seconds, on_progress, animate)
+        elapsed += took
+        errors.append(stderr)
+        return rc == 0
+
+    with tempfile.TemporaryDirectory(prefix=".self-mosh-", dir=dst.parent) as temp:
+        root = Path(temp)
+        for index, (start, frames, rev) in enumerate(segments):
+            seconds = frames / fps
+            vf = (f"fps={fps:.12g},trim=end_frame={frames},setpts=PTS-STARTPTS,"
+                  "setsar=1,format=yuv420p" + (",reverse" if rev else ""))
+            cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
+                   "-ss", f"{start / fps:.12g}", "-i", str(clip.path),
+                   "-t", f"{seconds:.12g}", "-map", "0:v:0", "-vf", vf,
+                   "-c:v", "ffv1"]
+            if audio:
+                af = (f"asetpts=PTS-STARTPTS,aresample=48000,apad,"
+                      f"atrim=duration={seconds:.12g}" + (",areverse" if rev else ""))
+                cmd += ["-map", "0:a:0", "-af", af, "-c:a", "pcm_s16le", "-ac", "2"]
+            else:
+                cmd += ["-an"]
+            cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error",
+                    str(root / f"cut{index}.nut")]
+            if not encode(cmd, seconds):
+                return False, "\n".join(errors), elapsed
+        # Relative generated filenames keep concat paths independent of user paths.
+        listing = root / "cuts.txt"
+        listing.write_text("".join(f"file 'cut{i}.nut'\nduration {frames / fps:.12g}\n"
+                                   for i, (_, frames, _) in enumerate(segments)), encoding="utf-8")
+        raw = root / "mosh.m4v"
+        boundaries, cursor = set(), 0
+        for _, frames, _ in segments:
+            boundaries.add(cursor)
+            cursor += frames
+        boundaries.update(end for _, end in windows if end < total_frames)
+        cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y", "-f", "concat",
+               "-safe", "0", "-i", str(listing), "-map", "0:v:0", "-an",
+               "-vf", f"fps={rate}", "-r", rate, "-frames:v", str(total_frames),
+               "-c:v", "mpeg4", "-q:v", str(opts.get("grit", 18)),
+               "-g", str(total_frames + 1), "-sc_threshold", "1000000000", "-bf", "0",
+               "-force_key_frames", ",".join(f"{frame / fps:.12g}" for frame in sorted(boundaries)),
+               "-f", "m4v", "-progress", "pipe:1", "-nostats", "-loglevel", "error", str(raw)]
+        if not encode(cmd, duration):
+            return False, "\n".join(errors), elapsed
+        raw.write_bytes(strip_ivops(raw.read_bytes(), "heavy", opts.get("fill", "chaos"),
+                                   seed, bloom=int(opts.get("bloom", 12)),
+                                   bloom_window=int(opts.get("bloom_window", 2)),
+                                   active_ranges=windows))
+        cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y", "-r", rate,
+               "-f", "m4v", "-i", str(raw)]
+        if audio:
+            if opts.get("audio", "auto") == "first":
+                cmd += ["-i", str(clip.path)]
+            else:
+                cmd += ["-f", "concat", "-safe", "0", "-i", str(listing)]
+            cmd += ["-map", "0:v:0", "-map", "1:a:0", "-af",
+                    f"apad,atrim=duration={duration:.12g},asetpts=PTS-STARTPTS",
+                    "-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+        else:
+            cmd += ["-map", "0:v:0", "-an"]
+        cmd += ["-c:v", "copy", "-movflags", "+faststart", "-progress", "pipe:1",
+                "-nostats", "-loglevel", "error", str(dst)]
+        ok = encode(cmd, duration)
+        return ok, "\n".join(errors), elapsed
+
+
+def run_pulse_datamosh(ctx: EffectContext, clip: Clip, tools: Tools, args,
+                      dst: Path, run_encode, on_progress, animate) -> tuple:
+    """Mosh scheduled bursts on an otherwise continuous source timeline."""
+    from datamosh_stream import pulse_ranges
+    from fractions import Fraction
+
+    opts = ctx.opts
+    fps = _fps_number(clip)
+    rate = str(Fraction(fps).limit_denominator(1001))
+    total = max(1, int(round((clip.duration or 0) * fps)))
+    duration = total / fps
+    try:
+        windows = pulse_ranges(clip.duration or 0, fps,
+                               float(opts.get("pulse_interval", 2)),
+                               float(opts.get("pulse_length", .5)),
+                               float(opts.get("pulse_start", 1)))
+    except ValueError as exc:
+        return False, str(exc), 0.0
+    boundaries = {0}
+    boundaries.update(frame for window in windows for frame in window if frame < total)
+    seed = int(opts.get("seed", 0)) or (20260925 + clip.size % 10000)
+    elapsed, errors = 0.0, []
+    with tempfile.TemporaryDirectory(prefix=".pulse-mosh-", dir=dst.parent) as temp:
+        raw = Path(temp) / "pulses.m4v"
+        cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y", "-i", str(clip.path),
+               "-map", "0:v:0", "-an", "-vf",
+               f"setpts=PTS-STARTPTS,fps={rate},setsar=1,format=yuv420p",
+               "-r", rate, "-frames:v", str(total), "-c:v", "mpeg4",
+               "-q:v", str(opts.get("grit", 18)), "-g", str(total + 1),
+               "-sc_threshold", "1000000000", "-bf", "0", "-force_key_frames",
+               ",".join(f"{frame / fps:.12g}" for frame in sorted(boundaries)),
+               "-f", "m4v", "-progress", "pipe:1", "-nostats", "-loglevel", "error", str(raw)]
+        rc, stderr, took = run_encode(cmd, duration, on_progress, animate)
+        elapsed += took
+        errors.append(stderr)
+        if rc != 0:
+            return False, "\n".join(errors), elapsed
+        if not raw.exists() or not raw.stat().st_size:
+            return False, "pulse encode produced no stream", elapsed
+        raw.write_bytes(strip_ivops(raw.read_bytes(), "heavy", opts.get("fill", "chaos"), seed,
+                                   bloom=int(opts.get("bloom", 12)),
+                                   bloom_window=int(opts.get("bloom_window", 2)), active_ranges=windows))
+        cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y", "-r", rate,
+               "-f", "m4v", "-i", str(raw)]
+        if clip.audio and opts.get("audio", "auto") != "none":
+            cmd += ["-i", str(clip.path), "-map", "0:v:0", "-map", "1:a:0", "-af",
+                    f"asetpts=PTS-STARTPTS,apad,atrim=duration={duration:.12g}",
+                    "-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+        else:
+            cmd += ["-map", "0:v:0", "-an"]
+        cmd += ["-c:v", "copy", "-movflags", "+faststart", "-progress", "pipe:1",
+                "-nostats", "-loglevel", "error", str(dst)]
+        rc, stderr, took = run_encode(cmd, duration, on_progress, animate)
+        elapsed += took
+        errors.append(stderr)
+        return rc == 0, "\n".join(errors), elapsed
+
+
 def run_datamosh(ctx: EffectContext, clip: Clip, tools: Tools, args,
                  dst: Path, run_encode, on_progress, animate) -> tuple:
     """encode one or two videos into an mpeg4 stream, edit its i-vops, remux."""
     opts = ctx.opts
+    if opts.get("algorithm") == "pulse":
+        return run_pulse_datamosh(ctx, clip, tools, args, dst, run_encode, on_progress, animate)
+    if opts.get("algorithm", "classic") in ("self", "shuffle"):
+        return run_self_datamosh(ctx, clip, tools, args, dst, run_encode, on_progress, animate)
     cut = str(opts.get("cut", "heavy"))
     fill = str(opts.get("fill", "chaos"))
     hold = _clamp_int(opts.get("hold", 12), 12, 2, 600)
@@ -2568,6 +2806,38 @@ def build_inversion(ctx: EffectContext) -> Plan:
     )
 
 
+RASTER_SLIP_PARAMS = (
+    Param("strength", "strength", "how strongly delayed bands replace the live picture",
+          "percent", 85, minimum=0, maximum=100, step=5),
+    Param("coverage", "slipped bands", "share of horizontal bands that fall out of sync",
+          "percent", 40, minimum=0, maximum=100, step=5),
+    Param("band_size", "band height", "height of each raster band as a percent of the frame",
+          "percent", 6, minimum=1, maximum=30, step=1),
+    Param("delay", "max delay", "seconds into the past; each band borrows a different moment",
+          "float", .35, minimum=0, maximum=2, step=.05),
+    Param("shift", "sideways slip", "horizontal tear distance as a percent of frame width",
+          "percent", 12, minimum=0, maximum=50, step=1),
+    Param("speed", "scan speed", "vertical sweeps per second; 0 pins bands in place",
+          "float", .25, minimum=0, maximum=3, step=.05),
+    Param("split", "RGB misalignment", "channel offset inside slipped bands, as a percent of width",
+          "percent", 1, minimum=0, maximum=10, step=1),
+    Param("seed", "random seed", "0 derives a repeatable raster pattern from the source",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_raster_slip(ctx: EffectContext) -> Plan:
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    return Plan(vf="stateful raster slip frame pass", out_suffix=ctx.suffix or "_RASTER_SLIPPED",
+                width=width, height=height,
+                notes=["travelling scan bands borrow different past frames and wrap sideways",
+                       f"{ctx.opts.get('delay', .35):g}s maximum delay, "
+                       f"{ctx.opts.get('coverage', 40)}% slipped bands, "
+                       f"{ctx.opts.get('split', 1)}% RGB misalignment",
+                       "live gaps stay current; zero strength, coverage or delay disables the effect",
+                       "NumPy required; bounded 128 MiB / 64-frame history, clean reset at scene cuts"])
+
+
 EFFECTS = [
     Effect(key="stretch", name="stretch",
            blurb="squash the frame into another shape",
@@ -2718,6 +2988,14 @@ EFFECTS = [
                "update bounded float history, apply sediment and excavation masks",
                "encode processed frames and any later FFmpeg filters with the source audio",
            )),
+    Effect(key="rasterslip", name="raster slip",
+           blurb="travelling scan bands tear sideways through different past moments",
+           tag="bounded delayed raster bands with RGB misalignment",
+           build=build_raster_slip, params=RASTER_SLIP_PARAMS,
+           frame_processor=RasterSlip,
+           stages=("decode RGB frames through earlier FFmpeg filters",
+                   "delay individual raster bands, slip them sideways, misalign RGB edges",
+                   "encode with later filters and original audio")),
 ]
 
 EFFECT_BY_KEY = {e.key: e for e in EFFECTS}
@@ -2731,7 +3009,7 @@ EFFECT_GROUPS = (
         "lobotomy", "neon",
     )),
     ("TIME & MEMORY", (
-        "trails", "timescratch", "sediment", "dropout", "inversion", "archaeology",
+        "trails", "timescratch", "sediment", "dropout", "inversion", "archaeology", "rasterslip",
     )),
     ("CODEC & BLOCKS", (
         "datamosh", "blockswap", "crunch",
@@ -3510,6 +3788,17 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
         runner = pass_effect.run
         ctx.opts = opts_of(opts, pass_effect)
         if pass_effect.key == "datamosh":
+            if ctx.opts.get("algorithm", "classic") in ("self", "shuffle"):
+                from datamosh_stream import self_mosh_segments
+                try:
+                    segments = self_mosh_segments(
+                        clip.duration or 0, _fps_number(clip),
+                        float(ctx.opts.get("cut_length", 2)), int(ctx.opts.get("segments", 0)),
+                        int(ctx.opts.get("reverse", 0)), int(ctx.opts.get("seed", 0)),
+                        shuffle=ctx.opts.get("algorithm") == "shuffle")
+                except ValueError as exc:
+                    return failed(str(exc))
+                render_duration = sum(s[1] for s in segments) / _fps_number(clip)
             second_path, _problem = resolve_second_video(
                 ctx.opts.get("second", "none"), Path(args.input_dir), clip.path)
             if second_path:
@@ -4461,7 +4750,7 @@ class OptRow:
     action: str = ""
 
 
-def option_rows(chain: Chain) -> list:
+def option_rows(chain: Chain, opts: Optional[dict] = None) -> list:
     """the options screen as rows: a header per effect (a longer chain only),
     then every option, then render and back"""
     rows = []
@@ -4469,6 +4758,19 @@ def option_rows(chain: Chain) -> list:
         if not chain.single:
             rows.append(OptRow("head", effect=effect))
         for param in effect.params:
+            if effect.key == "datamosh" and opts is not None:
+                is_self = opts_of(opts, effect).get("algorithm", "classic") in ("self", "shuffle")
+                if is_self and param.key in ("second", "second_start", "second_length",
+                                              "cut", "survival", "hold"):
+                    continue
+                if not is_self and param.key in ("cut_length", "segments", "transition", "reverse"):
+                    continue
+                is_pulse = opts_of(opts, effect).get("algorithm") == "pulse"
+                if is_pulse and param.key in ("second", "second_start", "second_length",
+                                             "cut", "survival", "hold"):
+                    continue
+                if not is_pulse and param.key in ("pulse_interval", "pulse_length", "pulse_start"):
+                    continue
             rows.append(OptRow("param", effect=effect, param=param))
     rows.append(OptRow("act", action="render"))
     rows.append(OptRow("act", action="back"))
@@ -4505,13 +4807,17 @@ def screen_effect_options(chain: Chain, clip: Clip, tools: Tools, args,
                              suffix=args.suffix, crf=args.crf,
                              preset=args.preset, opts=opts)
 
-    rows = option_rows(chain)
+    rows = option_rows(chain, opts)
     idx = next((i for i, r in enumerate(rows) if r.kind != "head"), 0)
     notice = initial_notice
     last_mosh_preset = opts.get("datamosh", {}).get("preset")
     top = 0
 
     while True:
+        selected = rows[idx]
+        rows = option_rows(chain, opts)
+        idx = next((i for i, candidate in enumerate(rows) if candidate == selected),
+                   min(idx, len(rows) - 1))
         if "datamosh" in opts:
             mine = opts["datamosh"]
             if mine["preset"] != last_mosh_preset:
@@ -5073,6 +5379,45 @@ def validate_datamosh_inputs(chain: Chain, opts: dict, targets: list,
     mine = opts_of(opts, effect)
     raw_second = mine.get("second", "none")
     audio_mode = str(mine.get("audio", "auto"))
+    if mine.get("algorithm") == "pulse":
+        from datamosh_stream import pulse_ranges
+        if str(raw_second).lower() not in ("", "none", "off"):
+            return "bloom pulses uses one source; remove --with / second or choose algorithm=classic"
+        if audio_mode not in ("auto", "first", "none"):
+            return f"audio={audio_mode} requires a second video; bloom pulses supports auto, first or none"
+        if not tools.ffprobe:
+            return "ffprobe is required for bloom pulse timing"
+        for primary in targets:
+            source = probe(primary, tools)
+            if not source.width or not source.height or not source.duration:
+                return "bloom pulses requires a readable video stream and duration"
+            try:
+                pulse_ranges(source.duration, _fps_number(source),
+                             float(mine.get("pulse_interval", 2)), float(mine.get("pulse_length", .5)),
+                             float(mine.get("pulse_start", 1)))
+            except ValueError as exc:
+                return str(exc)
+        return ""
+    if mine.get("algorithm", "classic") in ("self", "shuffle"):
+        from datamosh_stream import self_mosh_segments
+        if str(raw_second).lower() not in ("", "none", "off"):
+            return "self-mosh / cut shuffle use the source video; remove --with / second or choose algorithm=classic"
+        if audio_mode not in ("auto", "first", "none"):
+            return f"audio={audio_mode} requires a second video; self-mosh supports auto, first or none"
+        if not tools.ffprobe:
+            return "ffprobe is required for self-mosh segment timing"
+        for primary in targets:
+            source = probe(primary, tools)
+            if not source.width or not source.height or not source.duration:
+                return "self-mosh requires a readable video stream and duration"
+            try:
+                self_mosh_segments(source.duration, _fps_number(source),
+                                   float(mine.get("cut_length", 2)), int(mine.get("segments", 0)),
+                                   int(mine.get("reverse", 0)), int(mine.get("seed", 0)),
+                                   shuffle=mine.get("algorithm") == "shuffle")
+            except ValueError as exc:
+                return str(exc)
+        return ""
     if str(raw_second).lower() in ("", "none", "off"):
         if audio_mode in ("second", "mix"):
             return f"audio={audio_mode} requires a second video"

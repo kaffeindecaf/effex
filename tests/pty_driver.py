@@ -19,13 +19,18 @@ Usage:
 Arrow keys in a pty are application-mode: down \\x1bOB, up \\x1bOA,
 right \\x1bOC, left \\x1bOD.
 """
-import fcntl
 import os
+import sys
+
+if os.name == "nt":
+    print("  SKIP POSIX pseudo-terminal tests require Unix (fcntl/pty/termios)")
+    raise SystemExit(0)
+
+import fcntl
 import pty
 import select
 import struct
 import subprocess
-import sys
 import termios
 import time
 

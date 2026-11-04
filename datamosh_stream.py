@@ -5,6 +5,70 @@ Bloom/pulse techniques: github.com/GlitchTools/tomato and
 Only the rectangular, non-partitioned streams produced by Effex are supported.
 """
 import re
+import math
+import random
+
+
+def self_mosh_segments(duration, fps, cut_length, count, reverse, seed, shuffle=False):
+    """Return (start frame, frame count, reversed) cuts and a bounded plan.
+
+    Automatic mode covers the timeline, including a shorter final cut. A fixed
+    count samples nonoverlapping cuts evenly from the entire source.
+    """
+    # Container durations are often rounded to milliseconds (not frame time).
+    # Ceil would invent a tail frame for e.g. a 30000/1001 clip reported as 2.003s.
+    total = max(1, int(round(duration * fps)))
+    length = max(1, int(round(cut_length * fps)))
+    if count:
+        if count * length > total:
+            raise ValueError("segments × cut_length exceeds the source duration; "
+                             "choose fewer segments or shorter cuts")
+        starts = ([0] if count == 1 else
+                  [round(i * (total - length) / (count - 1)) for i in range(count)])
+    else:
+        if math.ceil(total / length) > 128:
+            raise ValueError("self-mosh supports up to 128 segments; increase cut_length "
+                             "or choose a segment count")
+        starts = range(0, total, length)
+    rng = random.Random(seed)
+    segments = [(start, min(length, total - start), rng.random() * 100 < reverse)
+                for start in starts]
+    if shuffle and len(segments) > 1:
+        original = segments[:]
+        rng.shuffle(segments)
+        if segments == original:
+            segments = segments[1:] + segments[:1]
+    return segments
+
+
+def transition_ranges(segments, fps, seconds):
+    """Frame windows following each join; clean frames recover outside them."""
+    length = max(0, int(round(seconds * fps)))
+    cursor = 0
+    windows = []
+    for index, (_, frames, _) in enumerate(segments):
+        if index and length:
+            windows.append((cursor, cursor + min(length, frames)))
+        cursor += frames
+    return windows
+
+
+def pulse_ranges(duration, fps, interval, length, start):
+    """Return frame-aligned bursts, each separated by clean recovery frames."""
+    total = max(1, int(round(duration * fps)))
+    if length == 0:
+        return []
+    spacing = max(1, int(round(interval * fps)))
+    frames = max(1, int(round(length * fps)))
+    if frames >= spacing:
+        raise ValueError("pulse_length must leave at least one clean frame before "
+                         "the next pulse; increase pulse_interval or reduce pulse_length")
+    first = max(0, int(round(start * fps)))
+    starts = range(first, total, spacing)
+    if len(starts) > 128:
+        raise ValueError("bloom pulses supports up to 128 bursts; increase pulse_interval "
+                         "or pulse_start")
+    return [(frame, min(total, frame + frames)) for frame in starts]
 
 
 class _Bits:
@@ -53,7 +117,7 @@ def clock_bits(raw: bytes) -> int:
     return max(1, (resolution - 1).bit_length())
 
 
-def _clock_end(vop: bytes, width: int) -> int:
+def clock_end(vop: bytes, width: int) -> int:
     bits = _Bits(vop)
     bits.read(32)  # VOP start code
     bits.read(2)   # coding type
@@ -73,8 +137,8 @@ def retime_vop(donor: bytes, target: bytes, width: int) -> bytes:
     Unary clock rollovers can change header length. Leave those slots alone
     rather than shifting byte-aligned resync markers inside the coded payload.
     """
-    donor_end = _clock_end(donor, width)
-    target_end = _clock_end(target, width)
+    donor_end = clock_end(donor, width)
+    target_end = clock_end(target, width)
     if donor_end != target_end:
         return target
     # Only the small timestamp prefix is parsed. Shift the payload as an integer
@@ -92,7 +156,23 @@ def retime_vop(donor: bytes, target: bytes, width: int) -> bytes:
         (size + padding) // 8, "big")
 
 
-def bloom_pvops(raw: bytes, repeat: int, window: int) -> bytes:
+def hold_vop(target: bytes, width: int) -> bytes:
+    """A non-coded P-VOP holds the reference image at the target timestamp.
+
+    Used when every clock-rollover slot is a cut: there may be no compatible
+    coded P-VOP to borrow. The next coded prediction still inherits stale pixels.
+    """
+    end = clock_end(target, width)
+    prefix = int.from_bytes(target, "big") >> (len(target) * 8 - end)
+    shift = end - 34
+    prefix = (prefix & ~(3 << shift)) | (1 << shift)
+    size = end + 1  # vop_coded = 0
+    padding = (-size) % 8
+    return (((prefix << 1) << padding) | ((1 << padding) - 1)).to_bytes(
+        (size + padding) // 8, "big")
+
+
+def bloom_pvops(raw: bytes, repeat: int, window: int, active_ranges=None) -> bytes:
     """Replace, not insert, P-VOP slots with cyclic bursts of prediction data.
 
     Every burst captures a fresh short run. This retains the frame count and
@@ -108,9 +188,17 @@ def bloom_pvops(raw: bytes, repeat: int, window: int) -> bytes:
     donors = []
     position = 0
     window = min(max(1, window), repeat)
+    frame = -1
     for start, end in zip(starts, starts[1:]):
         unit = raw[start:end]
         if unit.startswith(b"\x00\x00\x01\xb6") and len(unit) > 4:
+            frame += 1
+            if active_ranges is not None and not any(
+                    a <= frame < b for a, b in active_ranges):
+                donors.clear()
+                position = 0
+                out.extend(unit)
+                continue
             kind = unit[4] >> 6
             if kind == 0:
                 donors.clear()

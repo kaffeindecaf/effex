@@ -22,6 +22,7 @@ import tempfile
 import threading
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -155,7 +156,9 @@ def main() -> int:
     effex.last_render.clear()
     effex.last_render["error"] = "ffmpeg failed (exit 1)"
     frame = io.StringIO()
-    with contextlib.redirect_stdout(frame):
+    # Capturing stdout does not detach stdin from a real terminal. Rendering a
+    # frame for inspection must not wait for an interactive completion key.
+    with contextlib.redirect_stdout(frame), patch.object(sys.stdin, "isatty", return_value=False):
         effex.screen_done(types.SimpleNamespace(), False)
     shown = frame.getvalue()
     c.check("the failure screen shows the log path",

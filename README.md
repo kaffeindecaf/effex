@@ -73,7 +73,7 @@ elapsed time, speed and an estimated finish.
 
 ## effects
 
-25 effects, grouped the way the picker groups them. every one keeps the source
+26 effects, grouped the way the picker groups them. every one keeps the source
 frame size and audio unless its own section says otherwise.
 
 | effect | what it does | chains |
@@ -100,6 +100,7 @@ frame size and audio unless its own section says otherwise.
 | `dropout` | frames vanish at random - the picture holds | yes |
 | [`inversion`](#causality-inversion) | borrow real pixels from buffered future frames | yes |
 | [`archaeology`](#pixel-archaeology) | borrow a cutout from the future, then melt it away | yes |
+| [`rasterslip`](#raster-slip) | travelling scan bands tear sideways through different past moments | yes |
 | [`datamosh`](#heavy-datamosh) | codec-level melt - the decoder smears the motion | own pipeline |
 | [`blockswap`](#blockswap) | blocks trade places, teleport on a timer, optional mosh | own pipeline |
 | `crunch` | turn the bitrate and resolution down | yes |
@@ -659,6 +660,49 @@ the buffer is what limits resolution: the 128 MiB budget fits 18 frames at
 warning instead of growing without bound. End to end, a 2560x1440 clip renders
 at roughly 160 ms/frame including decode and encode.
 
+#### raster slip
+
+`rasterslip` lives under **TIME & MEMORY**. It makes the image behave like a
+display whose scan bands have lost synchronization. Some bands keep playing
+live; others borrow different moments from recent history, slide sideways with
+wraparound, and optionally split their RGB edges. The slipped bands travel
+vertically through the frame. History stores original incoming frames, so
+the effect does not accumulate an endless feedback smear.
+
+```sh
+./effex.py rasterslip input/clip.mp4
+./effex.py rasterslip input/clip.mp4 --set coverage=65 --set delay=0.7 --set shift=25 --set split=2 --set seed=17
+./effex.py neon+rasterslip+deepfry input/clip.mp4 --set rasterslip.speed=0.4
+```
+
+| option | meaning | default | range |
+| --- | --- | --- | --- |
+| `strength` | blend of delayed bands into the live picture | 85% | 0-100% |
+| `coverage` | share of bands that fall out of sync, rounded up to whole bands | 40% | 0-100% |
+| `band_size` | band height as a percent of the frame | 6% | 1-30% |
+| `delay` | maximum requested history age, in seconds; each band has its own delay | 0.35 | 0-2 |
+| `shift` | sideways tear distance as a percent of frame width | 12% | 0-50% |
+| `speed` | vertical sweeps per second; 0 pins the pattern | 0.25 | 0-3 |
+| `split` | RGB offset inside slipped bands, as a percent of frame width | 1% | 0-10% |
+| `seed` | repeatable band positions, ages and slip directions; 0 derives from source | 0 | 0-2147483647 |
+
+The first frame starts clean. Zero strength, coverage or delay passes frames
+through the processor unchanged and keeps no frame history. With zero shift,
+bands still lag in time; zero split aligns their RGB channels. Scene cuts,
+rewinds, frame-index jumps, new sources and explicit resets clear the history.
+Unavailable history near the start uses the earliest buffered frame.
+
+Requires NumPy from `requirements-stateful.txt`. Persistent pixel buffers are
+bounded to 128 MiB and history holds at most 64 frames; higher resolutions or
+frame rates can shorten the effective delay. A reduction appears in completion
+warnings and JSON. Output and temporary processing arrays are additional to
+that history budget. A frame too large to fit requires resizing first.
+
+Output keeps the frame size and source audio through the shared stateful
+renderer. It chains with ordinary filters and adjacent stateful effects, such
+as `neon+rasterslip+sediment+deepfry`. Standalone rendering uses the source's
+nominal frame rate; there is no stateful preview.
+
 ### codec and blocks
 
 <details>
@@ -706,6 +750,9 @@ regardless of argument order. `--set preset=...` is the **mosh** preset;
 
 In the menu, **second video** is the first row and **mosh preset** is the second.
 Changing the preset loads its codec knobs; they remain editable afterward.
+The **algorithm** row beside the preset chooses `classic` (the existing melt),
+`self-mosh`, `cut shuffle` or `bloom pulses`. Changing a preset keeps the
+selected algorithm and its timing settings.
 The options scroll on short terminals. `--set second=path` still works, while
 two positional files still mean two separate batch renders. Use `--with` for
 one combined video.
@@ -728,6 +775,102 @@ Technique references: [tomato's bloom/pulse modes](https://github.com/GlitchTool
 [tiberiuiancu/datamoshing's P-frame reuse](https://github.com/tiberiuiancu/datamoshing),
 and [python-moshion's two-source splice](https://github.com/rjmoggach/python-moshion).
 Effex implements these techniques independently; no repository code is vendored.
+
+##### self-mosh algorithm
+
+Cut one source into segments and datamosh it into itself. Each join starts a
+codec melt lasting `transition` seconds, followed by a clean recovery frame.
+The transition uses the incoming segment's motion against the previous image;
+it does not overlap segments or shorten the timeline.
+
+```sh
+./effex.py datamosh input/clip.mp4 --set algorithm=self --set cut_length=2 --set transition=0.75
+./effex.py datamosh input/clip.mp4 --set algorithm=self --set cut_length=1 --set segments=8 --set reverse=35 --set seed=17
+```
+
+| option | meaning | default | range |
+| --- | --- | --- | --- |
+| `algorithm` | choose the rendering method independently of the preset | classic | classic, self, shuffle, pulse |
+| `cut_length` | seconds per self-mosh segment | 2 | 0.1-60 |
+| `segments` | 0 cuts the entire source; otherwise sample this many evenly spaced cuts | 0 | 0-128 |
+| `transition` | seconds of mosh after each join; 0 gives clean cuts | 0.75 | 0-60 |
+| `reverse` | independent chance each segment plays backward | 0% | 0-100% |
+| `seed` | repeatable segment reversals and codec choices; 0 derives from the source | 0 | 0-2147483647 |
+
+Automatic segments cover the whole source, including a shorter final segment.
+A fixed count selects nonoverlapping cuts across the source, including its
+beginning and end (a count of 1 takes the first cut). The requested cuts must fit
+within the source; reduce their count or length if they do not. Lengths round to
+whole frames at the source's nominal frame rate. Automatic mode supports up to
+128 segments; use longer cuts or an explicit count for long sources.
+
+Transitions stop at the end of the incoming segment. The first segment starts
+clean. Heavy and standard presets still tune grit, fill and motion blooming;
+`cut`, `survival` and `hold` apply to classic only. A zero transition disables
+join surgery and blooming. Very short segments may have too little compatible
+prediction data to melt. `--dry-run` reports the source cuts and reversals.
+
+`audio=auto` follows the selected segments and reverses their audio with them.
+`audio=first` keeps the original soundtrack, trimmed/padded to the output length;
+`audio=none` removes it. Self-mosh uses a single source, so remove `--with` or
+`second` before selecting it. Lossless temporary cuts use disk space in the
+output folder and are removed on success, failure or cancellation. Reversal
+buffers at most one cut at a time; codec surgery still holds the compressed
+stream in memory.
+
+##### cut shuffle algorithm
+
+Choose **cut shuffle** in the algorithm row, or use `--set algorithm=shuffle`.
+It selects the same cuts as self-mosh, then scrambles their playback order
+before moshing the new joins. Every selected segment appears exactly once,
+including a shorter final cut. With two or more cuts, the result always changes
+their order. The same source, settings and seed reproduce the same cut order
+and reversals.
+
+```sh
+./effex.py datamosh input/clip.mp4 --set algorithm=shuffle --set cut_length=1 --set transition=0.4 --set reverse=25 --set seed=17
+```
+
+`cut_length`, `segments`, `transition`, `reverse`, presets and audio modes work
+as in self-mosh. Automatic audio travels with each shuffled cut. Use
+`audio=first` to retain the original soundtrack instead. This algorithm renders
+to `_SHUFFLE_MOSHED` outputs. Codec `cut=shuffle` remains the classic method
+that scrambles compressed motion frames; `algorithm=shuffle` reorders the
+actual source segments and melts their joins.
+
+##### bloom pulses algorithm
+
+Choose **bloom pulses** in the algorithm row, or use `--set algorithm=pulse`.
+It keeps the source in order and repeatedly applies motion/residual data during
+scheduled bursts. A clean recovery frame at the end of each burst restores
+the picture, leaving clean footage between pulses. Audio plays continuously.
+
+```sh
+./effex.py datamosh input/clip.mp4 --set algorithm=pulse --set pulse_interval=2 --set pulse_length=0.5 --set pulse_start=1
+```
+
+| option | meaning | default | range |
+| --- | --- | --- | --- |
+| `pulse_interval` | seconds between the starts of bursts | 2 | 0.1-3600 |
+| `pulse_length` | seconds per burst; 0 disables pulse surgery and blooming | 0.5 | 0-60 |
+| `pulse_start` | seconds of clean footage before the first burst | 1 | 0-3600 |
+
+Timing rounds to whole frames at the source's nominal frame rate. Each burst
+must leave at least one clean frame before the next; increase `pulse_interval`
+or reduce `pulse_length` if needed. Bursts are capped at the clip's end. A first
+pulse past the end produces no bursts, and the first video frame always starts
+clean. Up to 128 bursts are supported; increase the interval for longer clips.
+`--dry-run` lists the actual pulse windows.
+
+Presets tune grit, fill and motion bloom. Heavy repeats motion aggressively;
+standard disables blooming and gives keyframe-removal bursts. Increase `bloom`
+or reduce `bloom_window` to sustain repeated motion within a pulse. Very short
+bursts may contain too little motion to show a strong effect. Cut depth, hold,
+segment count, shuffle and reversal controls apply to other algorithms.
+
+Use one input, with `audio=auto` / `first` to keep its soundtrack or `none` to
+remove it. Outputs use `_PULSE_MOSHED`. Temporary streams are removed on success,
+failure or cancellation; compressed-stream surgery still scales with clip size.
 
 #### blockswap
 
@@ -779,7 +922,7 @@ single-pass effects stack with `+`, and order matters: `stretch+deepfry` is not
 
 `datamosh`, `timescratch` and `blockswap` edit the codec stream, so they run
 their own multi-pass pipeline and cannot be chained. stateful processors
-(`sediment`, `collapse`, `inversion`, `archaeology`) can sit before or after
+(`sediment`, `collapse`, `inversion`, `archaeology`, `rasterslip`) can sit before or after
 ordinary filters, but several of them must stay adjacent. stateful previews are
 not available.
 
@@ -850,7 +993,7 @@ the command for the platform it detected.
 | `ffmpeg` | renders every effect | the package manager below |
 | `ffprobe` | clip details, two-video datamosh, stateful effects | ships in the ffmpeg package |
 | python 3.8+ | runs effex | [python.org](https://www.python.org/downloads/) |
-| `numpy` (optional) | sediment, collapse, inversion | `requirements-stateful.txt` |
+| `numpy` (optional) | sediment, collapse, inversion, archaeology, raster slip | `requirements-stateful.txt` |
 | `opencv` (optional) | elastic collapse seam detail | `requirements-collapse.txt` |
 | `PyAV` (optional) | inversion timestamps | `requirements-inversion.txt` |
 
@@ -872,9 +1015,21 @@ answer `n` and the menu keeps the missing count visible; the `requirements` row
 exits 1 when something required is missing; `--check --json` reports `ok`,
 `platform`, `installer`, `hint` and one object per requirement.
 
-the optional modules are never installed by that prompt - they are pip packages,
-loaded only when rendering stateful effects. ordinary ffmpeg effects and `--list`
-still work without them:
+the runtime requirements prompt does not install optional modules. The Windows
+`install.ps1` script offers to download **all** dependencies, including those
+optional packages, in one y/n prompt. Answering `y` installs missing Python
+(3.13 when bootstrapping), FFmpeg and FFprobe via WinGet, creates/reuses the
+project's `.venv`, and installs NumPy, OpenCV and PyAV there. It verifies the
+tools and Python imports before reporting success. An existing interpreter for
+the full dependency install must be Python 3.10 or newer. If WinGet is needed
+but missing, install Microsoft's App Installer and rerun the script.
+
+Answering `n` (or pressing Enter) skips downloads and only sets up the launcher
+using an existing Python. Rerunning the installer reuses `.venv`. The installed
+launcher follows the repo's `effex.cmd`, so it also picks up a `.venv` created
+later. Optional modules are loaded only for the effects that need them;
+ordinary FFmpeg effects and `--list` work without them. To install packages
+manually:
 
 ```sh
 python3 -m pip install -r requirements-stateful.txt
@@ -948,11 +1103,12 @@ your paths and file names.
 | --- | --- |
 | `effex.py` | effect registry, cli, menu, ffmpeg planning, encoding, progress |
 | `stateful_effects.py` | cpu frame processors: sediment, collapse, inversion |
+| `raster_slip.py` | bounded past-frame raster bands, sideways tears and RGB offsets |
 | `future_cut.py` | pixel archaeology, a buffered look-ahead stage |
 | `datamosh_stream.py` | codec stream surgery: vop parsing and reuse |
 | `diagnostics.py` | the log file, rotation and the issue report |
 | `frame_pipeline.py`, `timestamped_frames.py` | packet plumbing for buffered stages |
-| `tests/` | 15 suites: cli, menu, layout, install, platform, logging, effects |
+| `tests/` | 19 suites: cli, menu, layout, install, platform, logging, effects |
 
 `input/` holds source clips. `output/` holds renders. Git ignores files in both folders except `.gitkeep`, so clips and renders stay local. Both paths can be changed with `--input-dir` / `--output-dir` or `EFFEX_INPUT_DIR` / `EFFEX_OUTPUT_DIR`.
 
@@ -961,7 +1117,10 @@ run the test suite with:
 ```sh
 python3 tests/run_tests.py
 python3 tests/run_tests.py psychedelic  # pixel behavior, options and real renders
-python3 tests/run_tests.py datamosh mosh-stream  # two sources, presets and codec clocks
+python3 tests/run_tests.py datamosh mosh-stream self-mosh  # joins, algorithms and codec clocks
+python3 tests/run_tests.py pulse-mosh  # timed bursts, clean recovery, audio and fractional rates
+python3 tests/run_tests.py raster-slip  # past-band provenance, wrapping, resets, memory and real renders
+python3 tests/run_tests.py windows-install  # isolated Windows installer scenarios; no downloads
 python3 tests/run_tests.py collapse seams  # deformation, carving and shared pipeline
 python3 tests/run_tests.py inversion  # future pixels, original PTS and EOF fallback
 python3 tests/run_tests.py archaeology archaeology-cli  # future-cut provenance and real renders

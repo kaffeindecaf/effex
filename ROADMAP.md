@@ -378,6 +378,16 @@ decision.
 
 ### stateful glitch effects
 
+**Shipped: raster slip (`rasterslip`).** Moving horizontal scan bands borrow
+different moments from a bounded past-frame history, wrap sideways, and split
+their RGB edges while other bands remain live. Strength, coverage, band height,
+delay, shift, speed, RGB split and seed are exposed in the menu and CLI. Shares
+the chain renderer and source audio; requires only NumPy. History resets at
+cuts/discontinuities and is capped at 64 frames / 128 MiB of persistent pixel
+buffers, with effective-delay warnings. Tests cover exact past-frame pixels,
+live gaps, wrapping, strength, determinism, motion, resets, bounded memory,
+disabled passthrough, audio, silent inputs and adjacent stateful chains.
+
 Six effects from the requested design prompt. Temporal Sediment, Elastic Collapse and Causality Inversion are implemented; the remaining three are checklist items, not implementations.
 
 Shared rules for the stateful effects:
@@ -869,6 +879,28 @@ scoured 2026-09-24. every entry names the repo, what it does, and which roadmap
 item it feeds. links were live at the time of writing.
 
 ### datamosh (landed as E2.25 - these shaped it)
+
+Algorithm picker added alongside codec presets. `classic` retains the existing
+whole-stream/two-source melt; `self` cuts the source, optionally reverses seeded
+segments, and limits each join's codec melt to a configurable recovery window.
+`shuffle` now reorders those source segments with a reproducible seed before
+moshing their joins; each selected segment appears once and audio follows it.
+`pulse` now schedules repeated-motion bursts on a continuous source, with
+interval, length and start controls plus clean recovery frames between bursts.
+
+Possible next algorithms (ideas, not implemented):
+
+- **Motion transplant**: choose an image segment and a separate motion donor;
+  apply the donor's prediction frames for a chosen interval, then recover.
+- **Ping-pong feedback**: alternate forward and reversed runs of the same cut,
+  with a clean reset every chosen number of cycles.
+- **Scene collision**: detect scene boundaries, remove their keyframes, and let
+  each new shot inherit the previous shot's pixels for a timed melt.
+- **Bloom pulse extensions**: add seeded random schedules or audio-driven burst
+  timing. Regular timed bursts and clean recovery have shipped.
+- **Cut shuffle extensions**: allow chosen cuts to repeat, or weight which cuts
+  appear more often. Basic seeded segment shuffling has shipped.
+
 
 - https://github.com/GlitchTools/tomato - bloom repeats one prediction frame;
   pulse repeats groups periodically. Informs the heavy preset's burst/window
