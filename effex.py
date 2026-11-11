@@ -39,6 +39,7 @@ from typing import Callable, Optional, cast
 from stateful_effects import CausalityInversion, ElasticCollapse, TemporalSediment
 from future_cut import FutureCut
 from raster_slip import RasterSlip
+from ripple_tank import RippleTank
 from flow_mosh import FlowMosh
 from block_melt import BlockMelt
 from diagnostics import ISSUES_URL, LOG, log_dir
@@ -412,7 +413,7 @@ def prepare_console() -> None:
 # ---------------------------------------------------------------------------
 
 OPTIONAL_MODULES = [
-    ("numpy", "sediment, collapse, inversion, archaeology, raster slip, block melt", "requirements-stateful.txt"),
+    ("numpy", "sediment, collapse, inversion, archaeology, raster slip, block melt, ripple tank", "requirements-stateful.txt"),
     ("cv2", "collapse seam detail, flowmosh", "requirements-collapse.txt"),
     ("av", "inversion timestamps", "requirements-inversion.txt"),
 ]
@@ -3066,6 +3067,40 @@ def build_raster_slip(ctx: EffectContext) -> Plan:
                        "NumPy required; bounded 128 MiB / 64-frame history, clean reset at scene cuts"])
 
 
+RIPPLE_TANK_PARAMS = (
+    Param("strength", "motion splash", "how hard movement in the clip pushes the water",
+          "percent", 60, minimum=0, maximum=100, step=5),
+    Param("threshold", "splash threshold", "brightness change a pixel needs before it makes waves",
+          "percent", 6, minimum=0, maximum=50, step=1),
+    Param("rain", "rain", "random drops per second, on top of the motion splashes",
+          "float", 1.5, minimum=0, maximum=20, step=.5),
+    Param("depth", "refraction", "how far the waves bend the picture, in pixels per unit slope",
+          "int", 14, minimum=0, maximum=60, step=2),
+    Param("ring", "ring time", "how long waves keep travelling before the water calms",
+          "percent", 85, minimum=0, maximum=100, step=5),
+    Param("speed", "wave speed", "grid cells a wave crosses per frame",
+          "float", .45, minimum=.05, maximum=.7, step=.05),
+    Param("prism", "prism", "how much red and blue refract differently",
+          "percent", 20, minimum=0, maximum=100, step=5),
+    Param("caustics", "caustics", "bright and dark light focusing where the surface curves",
+          "percent", 40, minimum=0, maximum=100, step=5),
+    Param("seed", "random seed", "0 derives repeatable rain from the source",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_ripple_tank(ctx: EffectContext) -> Plan:
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    return Plan(vf="stateful ripple tank frame pass", out_suffix=ctx.suffix or "_RIPPLED",
+                width=width, height=height,
+                notes=["movement drops stones into a simulated water surface over the picture",
+                       f"{ctx.opts.get('strength', 60)}% motion splash, "
+                       f"{ctx.opts.get('rain', 1.5):g} raindrops/s, "
+                       f"{ctx.opts.get('depth', 14)} px refraction",
+                       "zero splash and rain, or zero refraction and caustics, disables the effect",
+                       "NumPy required; wave grid capped at 360 cells, clean reset at scene cuts"])
+
+
 BLOCK_MELT_PARAMS = (
     Param("block", "macroblock size", "pixel size of the blocks that get dragged around",
           "choice", "16", choices=(
@@ -3287,6 +3322,15 @@ EFFECTS = [
            stages=("decode RGB frames through earlier FFmpeg filters",
                    "delay individual raster bands, slip them sideways, misalign RGB edges",
                    "encode with later filters and original audio")),
+    Effect(key="ripple", name="ripple tank",
+           blurb="movement splashes into water that bends the picture",
+           tag="2D wave equation driven by frame difference, refraction and caustics",
+           build=build_ripple_tank, params=RIPPLE_TANK_PARAMS,
+           frame_processor=RippleTank,
+           stages=("decode RGB frames through earlier FFmpeg filters",
+                   "push the wave surface where the source moves, step the wave equation, "
+                   "refract and light the frame through it",
+                   "encode with later filters and original audio")),
     Effect(key="blockmelt", name="block melt",
            blurb="macroblocks drag the stale picture along the motion",
            tag="block-matched motion vectors, residual dropped",
@@ -3301,7 +3345,7 @@ EFFECT_BY_KEY = {e.key: e for e in EFFECTS}
 EFFECT_GROUPS = (
     ("SHAPE & MOTION", (
         "stretch", "pixelize", "zoom", "wobble", "spin", "stutter", "slowmo",
-        "collapse",
+        "collapse", "ripple",
     )),
     ("COLOR & TEXTURE", (
         "rgbsplit", "deepfry", "posterize", "channelswap", "vhs", "crt",

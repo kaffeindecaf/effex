@@ -74,7 +74,7 @@ elapsed time, speed and an estimated finish.
 
 ## effects
 
-29 effects, grouped the way the picker groups them. every one keeps the source
+30 effects, grouped the way the picker groups them. every one keeps the source
 frame size and audio unless its own section says otherwise.
 
 | effect | what it does | chains |
@@ -87,6 +87,7 @@ frame size and audio unless its own section says otherwise.
 | `stutter` | chop the frame rate down | yes |
 | `slowmo` | speed the clip up or down, audio pitches with it | yes |
 | [`collapse`](#content-aware-elastic-collapse) | progressive content-aware scale, optional pixel mosh | yes |
+| [`ripple`](#ripple-tank) | movement splashes into water that bends the picture | yes |
 | `rgbsplit` | drift the color planes apart | yes |
 | `deepfry` | saturate and crunch it to death | yes |
 | `posterize` | crush the colors into bands | yes |
@@ -295,6 +296,51 @@ Seam averages include frames reusing a cached map, so p95 is dominated by the
 carving update. Skipping pixelation removes the extra downsample/upsample pass
 (about 5 ms mean in seam mode here) and is the default. These are measurements
 of this fixture on this host, not a promise for every input.
+
+#### ripple tank
+
+`ripple` sits under **SHAPE & MOTION**. It lays a simulated water surface over
+the clip and lets the footage disturb it: wherever the picture changes, the
+frame difference pushes the surface down, and the waves spread out, bounce off
+the frame edges and slowly calm. Optional rain drops random stones on top.
+The surface then acts like a lens. Each pixel is sampled along the slope of
+the water, so edges wobble and smear around anything that moves. Red and blue
+refract by slightly different amounts (a prism fringe), and curved parts of
+the surface focus light into bright and dark caustic patterns.
+
+```sh
+./effex.py ripple input/clip.mp4
+./effex.py ripple input/clip.mp4 --set rain=8 --set ring=95 --set depth=30
+./effex.py ripple input/clip.mp4 --set strength=0 --set rain=12 --set caustics=80
+./effex.py neon+ripple+crt input/clip.mp4 --set ripple.prism=60
+```
+
+| option | meaning | default | range |
+| --- | --- | --- | --- |
+| `strength` | how hard movement pushes the water | 60% | 0-100% |
+| `threshold` | brightness change a pixel needs before it makes waves; raise it for noisy footage | 6% | 0-50% |
+| `rain` | random drops per second | 1.5 | 0-20 |
+| `depth` | refraction strength, in pixels per unit of surface slope | 14 | 0-60 |
+| `ring` | how long waves keep travelling before they die out | 85% | 0-100% |
+| `speed` | grid cells a wave crosses each frame | 0.45 | 0.05-0.7 |
+| `prism` | how differently red and blue bend | 20% | 0-100% |
+| `caustics` | light focusing where the surface curves | 40% | 0-100% |
+| `seed` | repeatable rain; 0 derives from source | 0 | 0-2147483647 |
+
+The first frame starts clean, and still footage without rain is left exactly
+as it was. With `prism` and `caustics` at zero, every output pixel is a real
+pixel from the current frame, just moved. Zero `strength` and `rain`, or zero
+`depth` and `caustics`, passes frames through untouched. Scene cuts, rewinds,
+frame-index jumps and new sources calm the water.
+
+The wave grid is capped at 360 cells on its longest side and upsampled
+smoothly, so state stays under a couple of MiB at any resolution and the wave
+pattern keeps its shape at 360p and 4K (`depth` is in pixels, so raise it for
+big frames). Surface height is clamped, so even
+maximum settings cannot blow up. Waves move in frames, not seconds: a
+60 fps clip ripples twice as fast as the same clip at 30 fps. Requires NumPy
+from `requirements-stateful.txt`. It chains with ordinary filters and other
+stateful effects; there is no stateful preview.
 
 ### color and texture
 
@@ -1045,7 +1091,7 @@ single-pass effects stack with `+`, and order matters: `stretch+deepfry` is not
 `datamosh`, `timescratch`, `blockswap` and `bitrot` edit the codec stream, so they run
 their own multi-pass pipeline and cannot be chained. stateful processors
 (`sediment`, `collapse`, `inversion`, `archaeology`, `rasterslip`, `flowmosh`,
-`blockmelt`) can sit before or after
+`blockmelt`, `ripple`) can sit before or after
 ordinary filters, but several of them must stay adjacent. stateful previews are
 not available.
 
@@ -1116,7 +1162,7 @@ the command for the platform it detected.
 | `ffmpeg` | renders every effect | the package manager below |
 | `ffprobe` | clip details, two-video datamosh, stateful effects | ships in the ffmpeg package |
 | python 3.8+ | runs effex | [python.org](https://www.python.org/downloads/) |
-| `numpy` (optional) | sediment, collapse, inversion, archaeology, raster slip, block melt | `requirements-stateful.txt` |
+| `numpy` (optional) | sediment, collapse, inversion, archaeology, raster slip, block melt, ripple tank | `requirements-stateful.txt` |
 | `opencv` (optional) | elastic collapse seam detail, flowmosh | `requirements-collapse.txt` |
 | `PyAV` (optional) | inversion timestamps | `requirements-inversion.txt` |
 
@@ -1227,13 +1273,14 @@ your paths and file names.
 | `effex.py` | effect registry, cli, menu, ffmpeg planning, encoding, progress |
 | `stateful_effects.py` | cpu frame processors: sediment, collapse, inversion |
 | `raster_slip.py` | bounded past-frame raster bands, sideways tears and RGB offsets |
+| `ripple_tank.py` | motion-driven 2D wave simulation that refracts and lights the frame |
 | `flow_mosh.py` | optical-flow datamosh: a canvas warped by the source's motion |
 | `block_melt.py` | pixel-domain macroblock datamosh: block matching, residual-free motion compensation |
 | `future_cut.py` | pixel archaeology, a buffered look-ahead stage |
 | `datamosh_stream.py` | codec stream surgery: vop parsing and reuse |
 | `diagnostics.py` | the log file, rotation and the issue report |
 | `frame_pipeline.py`, `timestamped_frames.py` | packet plumbing for buffered stages |
-| `tests/` | 22 suites: cli, menu, layout, install, platform, logging, effects |
+| `tests/` | 23 suites: cli, menu, layout, install, platform, logging, effects |
 
 `input/` holds source clips. `output/` holds renders. Git ignores files in both folders except `.gitkeep`, so clips and renders stay local. Both paths can be changed with `--input-dir` / `--output-dir` or `EFFEX_INPUT_DIR` / `EFFEX_OUTPUT_DIR`.
 
@@ -1245,6 +1292,7 @@ python3 tests/run_tests.py psychedelic  # pixel behavior, options and real rende
 python3 tests/run_tests.py datamosh mosh-stream self-mosh  # joins, algorithms and codec clocks
 python3 tests/run_tests.py pulse-mosh  # timed bursts, clean recovery, audio and fractional rates
 python3 tests/run_tests.py raster-slip  # past-band provenance, wrapping, resets, memory and real renders
+python3 tests/run_tests.py ripple  # wave response, pixel provenance, seeds, bounds and real renders
 python3 tests/run_tests.py blockmelt  # blockwise motion compensation, keyframes, leak, seeds and real renders
 python3 tests/run_tests.py windows-install  # isolated Windows installer scenarios; no downloads
 python3 tests/run_tests.py collapse seams  # deformation, carving and shared pipeline
