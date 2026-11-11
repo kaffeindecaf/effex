@@ -151,18 +151,33 @@ writes JSON measurements. Timing excludes allocation tracing; a separate pass
 measures Python/NumPy allocations. Process peak RSS includes imports and native
 libraries. No entire clip is retained during processing.
 
-Measured after the forward bloom pass on Windows 11, Python 3.14.7, NumPy 2.5.4,
-OpenCV 5.0.0, one OpenCV thread, with the defaults above. These are CPU
-measurements, not guarantees of interactive playback speed; throughput varies
-with resolution and scene content.
+Measured with the forward bloom pass and the OpenCV-vectorized block operations
+on Windows 11, Python 3.14.7, NumPy 2.5.4, OpenCV 5.0.0, one OpenCV thread,
+with the defaults above. These are CPU measurements, not guarantees of
+interactive playback speed; throughput varies with resolution and scene content.
 
 | Resolution / clip | Processor fps | Peak traced allocations | Peak process RSS | Max buffered frames |
 | --- | ---: | ---: | ---: | ---: |
-| 320×180 / 120 frames | 50.1 | 17.8 MiB | 62.7 MiB | 25 |
+| 320×180 / 120 frames | 127.9 | 16.9 MiB | 60.7 MiB | 25 |
+| 320×180 / 480 frames | 124.9 | 17.0 MiB | 61.9 MiB | 25 |
+| 1280×720 / 72 frames | 9.8 | 233.5 MiB | 276.5 MiB | 25 |
+| 1920×1080 / 30 frames | 4.9 | 344.2 MiB | 386.7 MiB | 14 |
 
-The 120-frame CLI example, including decoding/encoding, took **3.26 seconds**.
-Peak retained processor state was 9.3 MiB with 25 frames buffered. The report is
-[available here](examples/reverse-infection/measurements.json).
+Block pooling, expansion, masked copies and the bloom blend run as OpenCV
+calls rather than NumPy boolean indexing. Against the previous measurements
+(50.1, 5.3 and 1.9 fps) that is about 2.6× at 320×180 and 1080p and 1.9× at
+720p, even though the old 720p and 1080p runs predate the bloom pass and did
+less work. With OpenCV's default threading the gain at 1080p is about 6×. The
+output is unchanged apart from rounding in the bloom blend (mean difference
+under 0.5 of 255).
+
+The 120-frame CLI example, including decoding/encoding, took **1.48 seconds**.
+Peak retained processor state was 9.3 MiB with 25 frames buffered. The 1080p
+run keeps 14 frames because the 512 MiB budget shortens lookahead there. The
+reports are [here](examples/reverse-infection/measurements.json),
+[720p](examples/reverse-infection/measurements-720p.json),
+[1080p](examples/reverse-infection/measurements-1080p.json) and
+[480 frames](examples/reverse-infection/measurements-long.json).
 
 The regression suite has **16 tests** covering early future-only color,
 consecutive propagation and verified flow direction/scaling, growth versus
