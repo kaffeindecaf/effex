@@ -353,7 +353,7 @@ class CollapseTests(unittest.TestCase):
 
             def frames(path):
                 decoded = subprocess.run(
-                    ["ffmpeg", "-v", "error", "-i", str(path), "-vsync", "0",
+                    ["ffmpeg", "-v", "error", "-i", str(path), "-fps_mode", "passthrough",
                      "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
                     capture_output=True, check=False)
                 self.assertEqual(decoded.returncode, 0, decoded.stderr.decode())
