@@ -801,7 +801,7 @@ regardless of argument order. `--set preset=...` is the **mosh** preset;
 In the menu, **second video** is the first row and **mosh preset** is the second.
 Changing the preset loads its codec knobs; they remain editable afterward.
 The **algorithm** row beside the preset chooses `classic` (the existing melt),
-`self-mosh`, `cut shuffle` or `bloom pulses`. Changing a preset keeps the
+`self-mosh`, `cut shuffle`, `bloom pulses` or **Reverse Infection**. Changing a preset keeps the
 selected algorithm and its timing settings.
 The options scroll on short terminals. `--set second=path` still works, while
 two positional files still mean two separate batch renders. Use `--with` for
@@ -826,6 +826,24 @@ Technique references: [tomato's bloom/pulse modes](https://github.com/GlitchTool
 and [python-moshion's two-source splice](https://github.com/rjmoggach/python-moshion).
 Effex implements these techniques independently; no repository code is vendored.
 
+##### Reverse Infection algorithm
+
+Future fragments spread backward through consecutive optical-flow warps, growing
+into the present before the actual subject arrives. Select **datamosh → algorithm
+→ Reverse Infection**; its options replace the codec controls, and `p` renders a
+three-second preview with buffered future context.
+
+```sh
+python -m pip install -r requirements-reverse-infection.txt
+python effex.py datamosh input/clip.mp4 --set algorithm=reverse_infection --set lookahead_frames=24 --set seed=42
+```
+
+Linux, macOS and Windows use the same CPU pipeline, with original video PTS,
+frame dimensions and compatible audio preserved. Set `intensity=0` to bypass.
+See [parameters, implementation, measurements and tests](docs/reverse-infection.md),
+the [rendered comparison](docs/examples/reverse-infection/comparison.mp4)
+(source left, infection right), and [contact sheet](docs/examples/reverse-infection/contact-sheet.png).
+
 ##### self-mosh algorithm
 
 Cut one source into segments and datamosh it into itself. Each join starts a
@@ -840,12 +858,12 @@ it does not overlap segments or shorten the timeline.
 
 | option | meaning | default | range |
 | --- | --- | --- | --- |
-| `algorithm` | choose the rendering method independently of the preset | classic | classic, self, shuffle, pulse |
+| `algorithm` | choose the rendering method independently of the preset | classic | classic, self, shuffle, pulse, reverse_infection |
 | `cut_length` | seconds per self-mosh segment | 2 | 0.1-60 |
 | `segments` | 0 cuts the entire source; otherwise sample this many evenly spaced cuts | 0 | 0-128 |
 | `transition` | seconds of mosh after each join; 0 gives clean cuts | 0.75 | 0-60 |
 | `reverse` | independent chance each segment plays backward | 0% | 0-100% |
-| `seed` | repeatable segment reversals and codec choices; 0 derives from the source | 0 | 0-2147483647 |
+| `seed` | repeatable segment reversals and codec choices; 0 derives from the source | 42 | 0-2147483647 |
 
 Automatic segments cover the whole source, including a shorter final segment.
 A fixed count selects nonoverlapping cuts across the source, including its

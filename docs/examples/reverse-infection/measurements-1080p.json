@@ -1,0 +1,49 @@
+{
+  "platform": "Windows-11-10.0.26300-SP0",
+  "python": "3.14.7",
+  "numpy": "2.5.4",
+  "opencv": "5.0.0",
+  "opencv_threads": 1,
+  "resolution": [
+    1920,
+    1080
+  ],
+  "config": {
+    "intensity": 0.75,
+    "lookahead_frames": 24,
+    "infection_strength": 0.8,
+    "backward_decay": 0.95,
+    "spread_radius": 3,
+    "block_size": 16,
+    "motion_alignment": 1.0,
+    "mutation_strength": 0.25,
+    "window_overlap": 8,
+    "seed": 42,
+    "lookahead_mode": "frames",
+    "lookahead_seconds": 1.0,
+    "flow_scale": 0.5
+  },
+  "throughput": {
+    "frames": 30,
+    "seconds": 17.58942399999978,
+    "fps": 1.7055703472723367,
+    "peak_traced_bytes": null,
+    "peak_process_rss_bytes": 484118528,
+    "peak_retained_state_bytes": 147899520,
+    "max_buffered_frames": 14,
+    "effective_lookahead_frames": 13,
+    "effective_overlap": 6
+  },
+  "memory": {
+    "frames": 30,
+    "seconds": 17.593439999999646,
+    "fps": 1.7051810220173318,
+    "peak_traced_bytes": 440314298,
+    "peak_process_rss_bytes": 484241408,
+    "peak_retained_state_bytes": 147899520,
+    "max_buffered_frames": 14,
+    "effective_lookahead_frames": 13,
+    "effective_overlap": 6
+  },
+  "notes": "Processor + synthetic generator; excludes video IO. Tracing is a separate pass. RSS includes interpreter/imports/native libraries and is process high-water."
+}

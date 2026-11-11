@@ -1,0 +1,3 @@
+# CPU-only, portable Linux/macOS/Windows packages; no FFglitch binary required.
+-r requirements-collapse.txt
+-r requirements-inversion.txt

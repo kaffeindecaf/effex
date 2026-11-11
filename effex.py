@@ -32,7 +32,7 @@ import threading
 import time
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional, cast
 
@@ -42,6 +42,7 @@ from raster_slip import RasterSlip
 from ripple_tank import RippleTank
 from flow_mosh import FlowMosh
 from block_melt import BlockMelt
+from reverse_infection import ReverseInfection
 from diagnostics import ISSUES_URL, LOG, log_dir
 
 VERSION = "0.16.0"
@@ -1288,6 +1289,35 @@ DATAMOSH_PRESETS = {
 }
 
 
+REVERSE_INFECTION_PARAMS = (
+    Param("intensity", "intensity", "Reverse Infection: overall strength; 0 bypasses", "float", .75,
+          minimum=0, maximum=1, step=.05),
+    Param("lookahead_frames", "future frames", "Reverse Infection: frames available ahead", "int", 24,
+          minimum=0, maximum=128, step=1),
+    Param("lookahead_mode", "lookahead units", "use frame count or original source timestamps", "choice", "frames",
+          choices=(("frames", "frames", "frame-based horizon"), ("seconds", "seconds", "timestamp-based horizon"))),
+    Param("lookahead_seconds", "future seconds", "Reverse Infection: timestamp horizon; capacity bounded", "float", 1.,
+          minimum=0, maximum=5, step=.1),
+    Param("infection_strength", "infection strength", "amount of future material inserted", "float", .8,
+          minimum=0, maximum=1, step=.05),
+    Param("backward_decay", "backward decay", "mask persistence per backward step", "float", .95,
+          minimum=0, maximum=1, step=.01),
+    Param("spread_radius", "spread radius", "growth in pixels per step; negative contracts", "int", 3,
+          minimum=-16, maximum=16, step=1),
+    Param("block_size", "block size", "size of displaced infection fragments", "int", 16,
+          minimum=1, maximum=128, step=1),
+    Param("motion_alignment", "motion alignment", "amount of consecutive optical-flow alignment", "float", 1.,
+          minimum=0, maximum=1, step=.05),
+    Param("mutation_strength", "mutation strength", "deterministic block displacement and fragmentation", "float", .25,
+          minimum=0, maximum=1, step=.05),
+    Param("window_overlap", "window overlap", "reconstructed frames blended across neighboring windows", "int", 8,
+          minimum=0, maximum=64, step=1),
+    Param("flow_scale", "flow scale", "analysis fraction; longest flow side capped at 320 pixels", "float", .5,
+          minimum=.125, maximum=1, step=.125),
+)
+REVERSE_INFECTION_KEYS = {p.key for p in REVERSE_INFECTION_PARAMS}
+
+
 DATAMOSH_PARAMS = (
     Param("second", "second video", "append another video before the codec melt",
           "video", "none"),
@@ -1302,6 +1332,7 @@ DATAMOSH_PARAMS = (
               ("self", "self-mosh", "cut this video into segments and melt their joins"),
               ("shuffle", "cut shuffle", "scramble this video's segments and melt the new joins"),
               ("pulse", "bloom pulses", "burst into repeated motion, then recover to clean footage"),
+              ("reverse_infection", "Reverse Infection", "future fragments spread backward through motion-compensated frames"),
           )),
     Param("pulse_interval", "pulse interval", "bloom pulses: seconds between the starts of bursts",
           "float", 2.0, minimum=0.1, maximum=3600.0, step=0.1),
@@ -1348,7 +1379,7 @@ DATAMOSH_PARAMS = (
     Param("bloom_window", "motion window", "number of motion frames cycled inside each bloom burst",
           "int", 2, minimum=1, maximum=12, step=1),
     Param("seed", "random seed", "0 uses a repeatable seed derived from the input",
-          "int", 0, minimum=0, maximum=2147483647, step=1),
+          "int", 42, minimum=0, maximum=2147483647, step=1),
     Param("audio", "audio", "audio stream to keep when rendering",
           "choice", "auto", choices=(
               ("auto", "follow the video join", "concatenate audio with the video"),
@@ -1357,7 +1388,7 @@ DATAMOSH_PARAMS = (
               ("mix", "mix both", "mix both audio tracks from the start"),
               ("none", "none", "render without audio"),
           )),
-)
+) + REVERSE_INFECTION_PARAMS
 
 def build_datamosh(ctx: EffectContext) -> Plan:
     opts = ctx.opts
@@ -1367,6 +1398,16 @@ def build_datamosh(ctx: EffectContext) -> Plan:
     second = str(opts.get("second", "none"))
     width, height = _source_dims(ctx.clip, ctx.frame)
     suffix = "_DATAMOSHED"
+    if opts.get("algorithm") == "reverse_infection":
+        config = ReverseInfection.validate_config(opts)
+        horizon = (f"{config['lookahead_frames']} frames" if config["lookahead_mode"] == "frames"
+                   else f"{config['lookahead_seconds']:g}s")
+        return Plan(vf="Reverse Infection: timestamped backward optical-flow propagation",
+                    out_suffix=ctx.suffix or "_REVERSE_INFECTED", width=width, height=height,
+                    notes=[f"buffers up to {horizon}; preview waits for future frames before emitting",
+                           "overlapping reconstructions blend at window joins; cuts/EOF drain within the scene",
+                           "preserves source PTS, dimensions and audio; 512 MiB budget can shorten lookahead",
+                           "CPU NumPy/OpenCV/PyAV: requirements-reverse-infection.txt (Linux/macOS/Windows)"])
     if opts.get("algorithm") == "pulse":
         from datamosh_stream import pulse_ranges
         fps = _fps_number(ctx.clip)
@@ -1801,6 +1842,13 @@ def run_datamosh(ctx: EffectContext, clip: Clip, tools: Tools, args,
                  dst: Path, run_encode, on_progress, animate) -> tuple:
     """encode one or two videos into an mpeg4 stream, edit its i-vops, remux."""
     opts = ctx.opts
+    if opts.get("algorithm") == "reverse_infection":
+        effect = replace(EFFECT_BY_KEY["datamosh"], run=None,
+                         frame_processor=ReverseInfection)
+        source = replace(clip, acodec=None) if opts.get("audio") == "none" else clip
+        nested = replace(ctx, clip=source, opts={"datamosh": dict(opts)})
+        return run_stateful_chain(one(effect), nested, source, tools, args, dst,
+                                  run_encode, on_progress, animate)
     if opts.get("algorithm") == "pulse":
         return run_pulse_datamosh(ctx, clip, tools, args, dst, run_encode, on_progress, animate)
     if opts.get("algorithm", "classic") in ("self", "shuffle"):
@@ -3175,7 +3223,7 @@ EFFECTS = [
            tag="lutrgb=floor(val/Q)*Q",
            build=build_posterize, params=POSTERIZE_PARAMS),
     Effect(key="datamosh", name="datamosh",
-           blurb="codec-level melt - the decoder smears the motion",
+           blurb="codec melts or future fragments infecting earlier motion",
            tag="two passes - mpeg4 i-vop removal, then a straight remux",
            build=build_datamosh, params=DATAMOSH_PARAMS,
            run=run_datamosh,
@@ -3754,6 +3802,8 @@ def run_encode(cmd: list, duration: Optional[float], on_progress,
         if feeder is not None:
             feeder.join(timeout=5)
         pump.join(timeout=2)
+        out.close()
+        errp.close()
         raise
 
     if feeder is not None:
@@ -3769,6 +3819,8 @@ def run_encode(cmd: list, duration: Optional[float], on_progress,
             feeder.join(timeout=2)
             feed_errors.append("frame producer did not stop after FFmpeg exited")
     pump.join(timeout=5)
+    out.close()
+    errp.close()
     returncode = proc.returncode or 0
     if feed_errors and returncode == 0:
         returncode = 1
@@ -3778,7 +3830,7 @@ def run_encode(cmd: list, duration: Optional[float], on_progress,
 
 def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tools,
                        args, dst: Path, run_encode_fn: Callable,
-                       on_progress, animate) -> tuple:
+                       on_progress, animate, preview_duration=None) -> tuple:
     """stream RGB frames through bounded stateful processors between FFmpeg filters."""
     stateful_positions = [i for i, effect in enumerate(chain.effects)
                           if effect.frame_processor is not None]
@@ -3884,6 +3936,8 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
         encode_cmd += ["-fps_mode", "passthrough", "-enc_time_base", "demux",
                        "-avoid_negative_ts", "disabled"]
     encode_cmd += merged.out_extra
+    if preview_duration is not None and clip.audio:
+        encode_cmd += ["-shortest"]
     encode_cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error",
                    str(dst)]
 
@@ -3928,11 +3982,25 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
                 target=drain_decoder, args=(decode_err,), daemon=True)
             error_thread.start()
             index = 0
+            preview_stopped = False
             if timestamped:
                 from frame_pipeline import process_packets
                 from timestamped_frames import read_packets, write_packets
                 packets = read_packets(decode_out, {"clip": clip, "fps": fps}, stop_event)
-                index = write_packets(process_packets(packets, processors), encoder_input,
+                processed = process_packets(packets, processors)
+                if preview_duration is not None:
+                    def preview_packets(stream):
+                        nonlocal preview_stopped
+                        start = None
+                        for packet in stream:
+                            if start is None:
+                                start = packet.timestamp
+                            if float(packet.timestamp - start) >= preview_duration:
+                                preview_stopped = True
+                                break
+                            yield packet
+                    processed = preview_packets(processed)
+                index = write_packets(processed, encoder_input,
                                       (height, width, 3), fps, stop_event)
             frame_bytes = width * height * 3
             while not timestamped and not stop_event.is_set():
@@ -3969,10 +4037,14 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
             if stop_event.is_set():
                 stop(decoder)
                 return
+            if preview_stopped:
+                # The preview deliberately stops before decoder EOF. Terminate
+                # its producer before waiting, or a full stdout pipe deadlocks.
+                stop(decoder)
             decode_rc = decoder.wait()
             error_thread.join(timeout=5)
             stderr = "\n".join(decoder_errors)
-            if decode_rc != 0:
+            if decode_rc != 0 and not preview_stopped:
                 raise RuntimeError(stderr or f"FFmpeg decoder exited {decode_rc}")
             if index == 0:
                 raise RuntimeError("decoder produced no video frames")
@@ -4013,6 +4085,11 @@ def drop_partial(dst: Path, source: Path) -> None:
         pass
 
 
+def is_reverse_infection(chain: Chain, opts: dict) -> bool:
+    return (chain.single and chain.effects[0].key == "datamosh"
+            and opts_of(opts, chain.effects[0]).get("algorithm") == "reverse_infection")
+
+
 def render_preview(chain: Chain, clip: Clip, tools: Tools, args,
                    opts: dict) -> tuple:
     """a ~3 second taste from the middle of the clip, into output/.
@@ -4020,7 +4097,8 @@ def render_preview(chain: Chain, clip: Clip, tools: Tools, args,
     returns (ok: bool, name_or_error: str). uses the same pipeline as a full
     render, just with a seek and a cap on the duration.
     """
-    if chain.multi_pass is not None or chain.stateful_effects:
+    infection = is_reverse_infection(chain, opts)
+    if (chain.multi_pass is not None or chain.stateful_effects) and not infection:
         return False, "preview is not available for stateful or multi-pass effects"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ctx = EffectContext(clip=clip, width=args.width, height=args.height,
@@ -4035,6 +4113,25 @@ def render_preview(chain: Chain, clip: Clip, tools: Tools, args,
                                 f"_PREVIEW.mp4",
         False,
     )
+
+    if infection:
+        values = opts_of(opts, chain.effects[0])
+        problem = validate_datamosh_inputs(chain, opts, [clip.path], args, tools)
+        if problem:
+            return False, problem
+        effect = replace(chain.effects[0], run=None, frame_processor=ReverseInfection)
+        source = replace(clip, acodec=None) if values.get("audio") == "none" else clip
+        try:
+            ok, error, _ = run_stateful_chain(
+                one(effect), ctx, source, tools, args, dst, run_encode,
+                lambda *_: None, False, preview_duration=take)
+        except KeyboardInterrupt:
+            drop_partial(dst, clip.path)
+            return False, "preview cancelled"
+        if not ok:
+            drop_partial(dst, clip.path)
+            return False, error
+        return True, dst.name
 
     cmd = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
            "-ss", f"{mid:.2f}", "-i", str(clip.path)]
@@ -4165,7 +4262,10 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
     cmd: list = []
     if runner is not None:
         if args.dry_run:
-            for line in chain.stage_lines:
+            stage_lines = (["decode timestamped RGB -> consecutive Farneback flow -> "
+                            "backward infection -> overlap blend -> libx264"]
+                           if is_reverse_infection(chain, opts) else chain.stage_lines)
+            for line in stage_lines:
                 _say("  " + line)
             if pass_effect is not None:
                 values = opts_of(opts, pass_effect)
@@ -5555,6 +5655,11 @@ def option_rows(chain: Chain, opts: Optional[dict] = None) -> list:
             rows.append(OptRow("head", effect=effect))
         for param in effect.params:
             if effect.key == "datamosh" and opts is not None:
+                is_infection = opts_of(opts, effect).get("algorithm") == "reverse_infection"
+                if is_infection and param.key not in REVERSE_INFECTION_KEYS | {"algorithm", "seed", "audio"}:
+                    continue
+                if not is_infection and param.key in REVERSE_INFECTION_KEYS:
+                    continue
                 is_self = opts_of(opts, effect).get("algorithm", "classic") in ("self", "shuffle")
                 if is_self and param.key in ("second", "second_start", "second_length",
                                               "cut", "survival", "hold"):
@@ -5691,7 +5796,9 @@ def screen_effect_options(chain: Chain, clip: Clip, tools: Tools, args,
 
         keys = ["\u2191\u2193 row", "\u2190\u2192 change",
                 "enter edit", "r render", "q back"]
-        if chain.multi_pass is None and not chain.stateful_effects:
+        can_preview = ((chain.multi_pass is None and not chain.stateful_effects)
+                       or is_reverse_infection(chain, opts))
+        if can_preview:
             keys.insert(-1, "p preview")
         draw(build_frame(f"{chain.name if chain.single else chain.key} options",
                          body, keys,
@@ -5706,7 +5813,7 @@ def screen_effect_options(chain: Chain, clip: Clip, tools: Tools, args,
 
         if key == "r":
             return opts
-        if key == "p" and chain.multi_pass is None and not chain.stateful_effects:
+        if key == "p" and can_preview:
             try:
                 made, name = render_preview(chain, clip, tools, args, opts)
             except Exception as exc:      # never let a preview kill the menu
@@ -5826,6 +5933,8 @@ def screen_confirm(chain: Chain, clip: Clip, args, opts: dict) -> bool:
         encode = (f"mpeg4  grit {mosh_opts.get('grit', 2)}  "
                   f"gop {mosh_opts.get('hold', 150)}  -> video copy")
         audio_description = str(mosh_opts.get("audio", "auto"))
+        if mosh_opts.get("algorithm") == "reverse_infection":
+            encode = f"CPU backward flow  ->  libx264  crf {args.crf}  preset {args.preset}"
     elif chain.stateful_effects:
         encode = f"CPU frame pass  ->  libx264  crf {args.crf}  preset {args.preset}"
     body = [
@@ -6199,6 +6308,18 @@ def validate_datamosh_inputs(chain: Chain, opts: dict, targets: list,
     mine = opts_of(opts, effect)
     raw_second = mine.get("second", "none")
     audio_mode = str(mine.get("audio", "auto"))
+    if mine.get("algorithm") == "reverse_infection":
+        if str(raw_second).lower() not in ("", "none", "off"):
+            return "Reverse Infection uses one source; remove --with / second"
+        if audio_mode not in ("auto", "first", "none"):
+            return "Reverse Infection supports audio=auto, first or none"
+        try:
+            ReverseInfection.validate_config(mine)
+        except ValueError as exc:
+            return str(exc)
+        if not tools.ffprobe:
+            return "ffprobe is required for Reverse Infection timestamps"
+        return ""
     if mine.get("algorithm") == "pulse":
         from datamosh_stream import pulse_ranges
         if str(raw_second).lower() not in ("", "none", "off"):

@@ -25,6 +25,7 @@ SUITES = {
     "mosh-stream": HERE / "datamosh_stream.py",
     "self-mosh": HERE / "self_mosh.py",
     "pulse-mosh": HERE / "pulse_mosh.py",
+    "reverse-infection": HERE / "reverse_infection_regression.py",
     "menu": HERE / "menu_smoke.py",
     "layout": HERE / "layout.py",
     "install": HERE / "install_prompt.py",

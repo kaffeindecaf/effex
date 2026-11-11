@@ -23,7 +23,7 @@ jobs:
           sudo apt-get install -y ffmpeg
           python -m pip install -r requirements-collapse.txt -r requirements-inversion.txt ruff
       - name: check changed processor code
-        run: ruff check --select F frame_pipeline.py timestamped_frames.py stateful_effects.py tests/inversion_regression.py tests/platform_support.py tests/install_prompt.py tests/logging_regression.py
+        run: ruff check --select F frame_pipeline.py timestamped_frames.py stateful_effects.py reverse_infection.py tests/reverse_infection_regression.py benchmarks/reverse_infection.py tests/inversion_regression.py tests/platform_support.py tests/install_prompt.py tests/logging_regression.py
       - name: run every suite with optional dependencies present
         run: python tests/run_tests.py
 
