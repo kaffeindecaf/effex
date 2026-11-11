@@ -829,7 +829,9 @@ Effex implements these techniques independently; no repository code is vendored.
 ##### Reverse Infection algorithm
 
 Future fragments spread backward through consecutive optical-flow warps, growing
-into the present before the actual subject arrives. Select **datamosh → algorithm
+into the present before the actual subject arrives, then bloom forward through
+moving frames in a Blockswap-style feedback pass. `bloom_strength` controls the
+carried damage and `diffusion` softens its spread. Select **datamosh → algorithm
 → Reverse Infection**; its options replace the codec controls, and `p` renders a
 three-second preview with buffered future context.
 

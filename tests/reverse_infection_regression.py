@@ -98,9 +98,13 @@ class InfectionTests(unittest.TestCase):
                           np.zeros((*a.shape, 2), np.float32)):
             output = list(process_packets(iter(frames), [p]))
         allowed = {tuple(c) for c in palette.tolist()}
-        for q in output[:12]:
-            colors = {tuple(c) for c in np.unique(q.frame.reshape(-1, 3), axis=0).tolist()}
-            self.assertTrue(colors <= allowed, f"frame {q.index} introduced faded/dilated colors")
+        # The first reconstruction is hard block replacement; later frames
+        # intentionally add intermediate colors as the carried mask diffuses.
+        first_colors = {tuple(c) for c in np.unique(output[0].frame.reshape(-1, 3), axis=0).tolist()}
+        self.assertTrue(first_colors <= allowed, "the seed frame must preserve full-strength texture")
+        later_color_counts = [len(np.unique(q.frame.reshape(-1, 3), axis=0)) for q in output[1:12]]
+        self.assertGreater(max(later_color_counts), len(allowed),
+                           "forward bloom should diffuse into later frames")
         early = output[8].frame
         self.assertGreater(np.count_nonzero(np.any(early != background, axis=2)), 100)
         # Corruption moves/repeats actual texture outside the donor silhouette.

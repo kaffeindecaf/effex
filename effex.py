@@ -1310,6 +1310,10 @@ REVERSE_INFECTION_PARAMS = (
           minimum=0, maximum=1, step=.05),
     Param("mutation_strength", "mutation strength", "held/overdriven motion vectors and repeated block displacement", "float", .25,
           minimum=0, maximum=1, step=.05),
+    Param("bloom_strength", "motion bloom", "carry infected blocks forward into later moving frames", "float", .9,
+          minimum=0, maximum=1, step=.05),
+    Param("diffusion", "bloom diffusion", "soften and spread the mask around carried blocks", "float", .85,
+          minimum=0, maximum=1, step=.05),
     Param("window_overlap", "window overlap", "frames switched by block across neighboring windows", "int", 8,
           minimum=0, maximum=64, step=1),
     Param("flow_scale", "flow scale", "analysis fraction; longest flow side capped at 320 pixels", "float", .5,
@@ -1402,10 +1406,10 @@ def build_datamosh(ctx: EffectContext) -> Plan:
         config = ReverseInfection.validate_config(opts)
         horizon = (f"{config['lookahead_frames']} frames" if config["lookahead_mode"] == "frames"
                    else f"{config['lookahead_seconds']:g}s")
-        return Plan(vf="Reverse Infection: timestamped backward optical-flow propagation",
+        return Plan(vf="Reverse Infection: backward propagation with forward block bloom",
                     out_suffix=ctx.suffix or "_REVERSE_INFECTED", width=width, height=height,
                     notes=[f"buffers up to {horizon}; preview waits for future frames before emitting",
-                           "damaged prediction blocks repeat future texture; block switches join windows without fades",
+                            "damaged prediction blocks bloom forward through motion-compensated frames; diffusion softens their edges",
                            "preserves source PTS, dimensions and audio; 512 MiB budget can shorten lookahead",
                            "CPU NumPy/OpenCV/PyAV: requirements-reverse-infection.txt (Linux/macOS/Windows)"])
     if opts.get("algorithm") == "pulse":

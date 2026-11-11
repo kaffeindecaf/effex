@@ -18,13 +18,15 @@ class ReverseInfection:
     DEFAULTS = dict(intensity=.75, lookahead_frames=24, infection_strength=.8,
                     backward_decay=.95, spread_radius=3, block_size=16,
                     motion_alignment=1., mutation_strength=.25, window_overlap=8,
-                    seed=42, lookahead_mode="frames", lookahead_seconds=1.,
+                    bloom_strength=.9, diffusion=.85, seed=42,
+                    lookahead_mode="frames", lookahead_seconds=1.,
                     flow_scale=.5)
     BOUNDS = dict(intensity=(0, 1), lookahead_frames=(0, 128),
                   infection_strength=(0, 1), backward_decay=(0, 1),
                   spread_radius=(-16, 16), block_size=(1, 128),
                   motion_alignment=(0, 1), mutation_strength=(0, 1),
-                  window_overlap=(0, 64), seed=(0, 2147483647),
+                  window_overlap=(0, 64), bloom_strength=(0, 1),
+                  diffusion=(0, 1), seed=(0, 2147483647),
                   lookahead_seconds=(0, 5), flow_scale=(.125, 1))
 
     def __init__(self):
@@ -125,6 +127,7 @@ class ReverseInfection:
     def reset(self):
         self._queue.clear()
         self._overlap.clear()
+        self._feedback_frame = self._feedback_mask = self._feedback_gray = None
         self._next_index = self._last_timestamp = self._source = None
         self.capacity_fallbacks = 0
         self.peak_buffered_frames = 0
@@ -139,6 +142,8 @@ class ReverseInfection:
         return (sum(e["packet"].frame.nbytes + e["gray"].nbytes
                     + (e["flow"].nbytes if e["flow"] is not None else 0) for e in self._queue)
                 + sum(f.nbytes for f in self._overlap.values())
+                + sum(a.nbytes for a in (self._feedback_frame, self._feedback_mask,
+                                          self._feedback_gray) if a is not None)
                 + sum(a.nbytes for a in self._noise)
                 + sum(a.nbytes for a in self._grid))
 
@@ -151,6 +156,13 @@ class ReverseInfection:
         if min(previous.shape) < 8:
             return self._np.zeros((*previous.shape, 2), self._np.float32)
         return self._cv2.calcOpticalFlowFarneback(previous, future, None,
+                                                 .5, 3, 21, 3, 5, 1.2, 0)
+
+    def _estimate_feedback_flow(self, current, previous):
+        """Estimate the inverse sampling map used to carry pixels forward."""
+        if min(current.shape) < 8:
+            return self._np.zeros((*current.shape, 2), self._np.float32)
+        return self._cv2.calcOpticalFlowFarneback(current, previous, None,
                                                  .5, 3, 21, 3, 5, 1.2, 0)
 
     def _full_flow(self, small):
@@ -274,6 +286,60 @@ class ReverseInfection:
         result[selected] = donor[selected]
         return result
 
+    def _mosh_feedback(self, original, infected, gray):
+        """Carry damaged prediction blocks forward like a bounded codec bloom."""
+        np, cv2 = self._np, self._cv2
+        # The backward pass replaces whole blocks. Turn those changes into a
+        # support mask; the pixels remain intact while only the edge of their
+        # moving support is diffused.
+        local = (self._pool_blocks(
+            (cv2.absdiff(original, infected).max(axis=2) > 3).astype(np.float32),
+            maximum=True) > 0).astype(np.float32)
+        local = self._expand_blocks(local)
+        if self._feedback_frame is None:
+            self._feedback_frame = infected.copy()
+            self._feedback_mask = local
+            self._feedback_gray = gray.copy()
+            return infected
+
+        # Farneback(current, previous) gives the sampling map required to pull
+        # the previous infected canvas into current-frame coordinates.
+        flow_small = self._estimate_feedback_flow(gray, self._feedback_gray)
+        flow = self._full_flow(flow_small)
+        carried = self._warp(self._feedback_frame, flow,
+                             interpolation=cv2.INTER_LINEAR,
+                             border_mode=cv2.BORDER_REFLECT_101)
+        carried_mask = self._warp(self._feedback_mask, flow,
+                                  interpolation=cv2.INTER_LINEAR,
+                                  border_mode=cv2.BORDER_CONSTANT)
+        strength = self._config["bloom_strength"]
+        diffusion = self._config["diffusion"]
+        # Let fresh reverse-infected blocks join the moving feedback canvas.
+        support = np.maximum(carried_mask * (.94 + .05 * strength), local)
+        radius = min(24, int(math.ceil(self._config["block_size"] * diffusion)))
+        if radius:
+            diameter = radius * 2 + 1
+            support = cv2.dilate(support, np.ones((diameter, diameter), np.uint8))
+        sigma = min(self._config["block_size"] * diffusion * .35, 12)
+        if sigma > .1:
+            size = max(3, int(math.ceil(sigma * 6)) | 1)
+            support = cv2.GaussianBlur(support, (size, size), sigmaX=sigma,
+                                       borderType=cv2.BORDER_REFLECT_101)
+        alpha = np.clip(support * strength, 0, .9)[..., None]
+        result = np.clip(original.astype(np.float32) * (1 - alpha)
+                         + carried.astype(np.float32) * alpha,
+                         0, 255).astype(np.uint8)
+        # A fresh backward-propagated tile wins over an older, softer echo.
+        # Diffusion applies around its boundary; it never erases the new block.
+        result[local > 0] = infected[local > 0]
+        # Accumulate actual output so carried blocks can infect subsequent
+        # frames. A small persistence loss avoids turning the whole clip into a
+        # uniform overlay after a long run.
+        self._feedback_frame = result
+        self._feedback_mask = np.maximum(local, carried_mask * .96)
+        self._feedback_gray = gray.copy()
+        return result
+
     def _reconstruct(self, end):
         """Yield (position, reconstruction) backward, carrying mutated pixels."""
         np, cv2 = self._np, self._cv2
@@ -330,7 +396,11 @@ class ReverseInfection:
             outputs[end] = self._queue[end]["packet"].frame.copy()
         self._overlap = new_overlap
         for pos in range(hop):
-            yield replace(self._queue[pos]["packet"], frame=outputs.pop(pos))
+            entry = self._queue[pos]
+            result = outputs.pop(pos)
+            if not (final and pos == end):
+                result = self._mosh_feedback(entry["packet"].frame, result, entry["gray"])
+            yield replace(entry["packet"], frame=result)
         del self._queue[:hop]
 
     def push(self, packet):
@@ -366,6 +436,7 @@ class ReverseInfection:
                                 - b[::stride, ::stride]).mean() > 100
             if cut:
                 yield from self.flush()
+                self._feedback_frame = self._feedback_mask = self._feedback_gray = None
             else:
                 old["flow"] = self._estimate_flow(old["gray"], gray)
         self._queue.append(dict(packet=replace(packet, frame=packet.frame.copy(),
