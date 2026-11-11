@@ -100,21 +100,80 @@ def apply_palette(enabled: bool) -> None:
     REV_OFF = "\033[27m" if enabled else ""
 
 
+def _cell_width(ch: str) -> int:
+    """terminal cells one character takes: wide cjk/emoji 2, combining 0"""
+    if ch < "\u0300":
+        return 0 if ch < " " else 1
+    import unicodedata
+    if unicodedata.combining(ch) or ch in "\u200b\u200c\u200d\ufe0f":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def text_width(plain: str) -> int:
+    """cells a string without escapes takes on screen"""
+    if plain.isascii():
+        return len(plain)
+    return sum(_cell_width(ch) for ch in plain)
+
+
 def vlen(s: str) -> int:
     """visible width of a string, ansi escapes not counted"""
-    return len(_ANSI_RE.sub("", s))
+    return text_width(_ANSI_RE.sub("", s))
 
 
 def pad(s: str, width: int) -> str:
     return s + " " * max(0, width - vlen(s))
 
 
+def _cut_cells(plain: str, width: int) -> str:
+    """the longest prefix that fits in `width` cells"""
+    used = 0
+    for i, ch in enumerate(plain):
+        used += _cell_width(ch)
+        if used > width:
+            return plain[:i]
+    return plain
+
+
 def trunc(s: str, width: int) -> str:
     """cut to a visible width; colours are lost, add them back afterwards"""
     plain = _ANSI_RE.sub("", s)
-    if len(plain) <= width:
+    if text_width(plain) <= width:
         return plain
-    return plain[:max(0, width - 1)] + "\u2026"
+    return _cut_cells(plain, max(0, width - 1)) + "\u2026"
+
+
+_ESC_TOKEN_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
+
+
+def clip_visible(s: str, width: int) -> str:
+    """cut to a visible width but keep the colour codes.
+
+    the safety net for whole frames: a line that would wrap breaks the next
+    redraw, so anything wider than the terminal is cut here with an ellipsis.
+    """
+    if vlen(s) <= width:
+        return s
+    out = []
+    used = 0
+    pos = 0
+    limit = max(0, width - 1)
+    while pos < len(s):
+        match = _ESC_TOKEN_RE.match(s, pos)
+        if match:
+            out.append(match.group())
+            pos = match.end()
+            continue
+        cells = _cell_width(s[pos])
+        if used + cells > limit:
+            break
+        out.append(s[pos])
+        used += cells
+        pos += 1
+    if width > 0:
+        out.append("\u2026")
+    return "".join(out) + (_C_NC if "\033[" in s else "")
 
 
 def fit(s: str, width: int) -> str:
@@ -3731,7 +3790,7 @@ def run_stateful_chain(chain: Chain, ctx: EffectContext, clip: Clip, tools: Tool
         try:
             import av  # noqa: F401 - dependency check before launching FFmpeg
         except ImportError:
-            return False, "Causality Inversion needs requirements-inversion.txt (PyAV)", 0.0
+            return False, f"{chain.name} needs requirements-inversion.txt (PyAV)", 0.0
 
     prefix = ",".join(p.vf for e, p in plans[:first]
                       if p.vf and e.frame_processor is None)
@@ -3963,7 +4022,12 @@ def render_preview(chain: Chain, clip: Clip, tools: Tools, args,
             pct = f"{int(frac * 100):3d}%"
         else:
             frac, stamp, pct = 0.0, human_time(elapsed), "  ?"
-        row = f"  {_bar(frac)}  {B}{pct}{NC}  {C_DIM}{stamp}{NC}"
+        cols = term_cols()
+        bar_cells = max(4, min(24, cols - 30))
+        row = f"  {_bar(frac, bar_cells)}  {B}{pct}{NC}  {C_DIM}{stamp}{NC}"
+        # a line wider than the terminal wraps, and "\r" then only returns to
+        # the wrapped half - every update would print a fresh line
+        row = clip_visible(row, cols - 1)
         sys.stdout.write("\r" + row + _CLEAR_EOL)
         sys.stdout.flush()
         last["len"] = vlen(row)
@@ -3972,12 +4036,12 @@ def render_preview(chain: Chain, clip: Clip, tools: Tools, args,
         rc, stderr, _elapsed = run_encode(cmd, take, on_progress, animate)
     except KeyboardInterrupt:
         if animate:
-            sys.stdout.write("\r" + " " * last["len"] + "\r")
+            sys.stdout.write("\r" + _CLEAR_EOL)
             sys.stdout.flush()
         drop_partial(dst, clip.path)
         return False, "preview cancelled"
     if animate:
-        sys.stdout.write("\r" + " " * last["len"] + "\r")
+        sys.stdout.write("\r" + _CLEAR_EOL)
         sys.stdout.flush()
 
     if rc != 0 or not dst.exists() or dst.stat().st_size == 0:
@@ -4172,13 +4236,30 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
         if animate:
             draw_render_monitor(done, total, elapsed)
 
-    if not args.json:
-        draw_render_monitor(0.0, clip.duration or render_duration or None, 0.0)
+    def run_monitored(start: Callable) -> tuple:
+        """run the encode under the live monitor.
+
+        a cli render takes the alternate screen for the monitor and gives it
+        back before anything is printed, so the shell keeps its scrollback and
+        the summary or the error lands under the command that started it.
+        """
+        own_screen = (not args.json) and sys.stdout.isatty() and not SCREEN.on
+        if own_screen:
+            SCREEN.open()
+        try:
+            if not args.json:
+                draw_render_monitor(0.0, clip.duration or render_duration
+                                    or None, 0.0)
+            return start()
+        finally:
+            if own_screen:
+                SCREEN.close()
 
     if runner is not None:
         try:
-            okk, stderr, elapsed = runner(ctx, clip, tools, args, dst,
-                                          run_encode, on_progress, animate)
+            okk, stderr, elapsed = run_monitored(
+                lambda: runner(ctx, clip, tools, args, dst,
+                               run_encode, on_progress, animate))
         except KeyboardInterrupt:
             drop_partial(dst, clip.path)
             last_render["error"] = "cancelled, partial file removed"
@@ -4197,8 +4278,8 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
             return False
     else:
         try:
-            rc, stderr, elapsed = run_encode(cmd, clip.duration, on_progress,
-                                             animate)
+            rc, stderr, elapsed = run_monitored(
+                lambda: run_encode(cmd, clip.duration, on_progress, animate))
         except KeyboardInterrupt:
             drop_partial(dst, clip.path)
             last_render["error"] = "cancelled, partial file removed"
@@ -4301,27 +4382,122 @@ def _read_key_windows() -> str:
     return decode_windows_key(first)
 
 
+# final byte of a CSI sequence -> key (ESC [ A, ESC [ 1;5 A, ...)
+CSI_FINAL_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left",
+                  "H": "home", "F": "end"}
+# ESC [ <n> ~ -> key; vt220 / xterm / rxvt / linux console numbering
+CSI_TILDE_KEYS = {"1": "home", "7": "home", "4": "end", "8": "end",
+                  "5": "pgup", "6": "pgdn", "3": "delete", "2": "insert"}
+# ESC O <x> - application cursor mode and the keypad
+SS3_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left",
+            "H": "home", "F": "end", "M": "\r"}
+
+ESC_WAIT = 0.05      # a lone ESC: how long to wait for the rest of a sequence
+SEQ_WAIT = 0.1       # inside a sequence: bytes can straggle over ssh
+SEQ_MAX = 32         # give up on a runaway sequence after this many bytes
+
+
+def decode_key(read: Callable[[Optional[float]], bytes]) -> str:
+    """decode one keypress from a byte source.
+
+    `read(timeout)` returns one byte, or b"" when nothing arrived in time
+    (timeout None blocks); it raises EOFError when the stream is closed.
+
+    every escape sequence is read to its final byte so nothing is left in the
+    buffer to be read later as keys (PgUp is ESC [ 5 ~ - reading only ESC [ 5
+    used to leave a stray "~" and turn the "5" into a quick-pick). sequences
+    the menus do not use come back as "" - the caller just reads again - never
+    as "esc", which means go back. utf-8 characters are read whole.
+    """
+    first = read(None)
+    if not first:
+        raise EOFError("stdin closed")
+    byte = first[0]
+    if byte == 0x1B:
+        return _decode_escape(read)
+    if byte < 0x80:
+        return chr(byte)
+    need = (1 if 0xC0 <= byte < 0xE0 else 2 if 0xE0 <= byte < 0xF0
+            else 3 if 0xF0 <= byte < 0xF8 else 0)
+    data = first
+    for _ in range(need):
+        nxt = read(SEQ_WAIT)
+        if not nxt:
+            break
+        data += nxt
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def _decode_escape(read: Callable[[Optional[float]], bytes]) -> str:
+    nxt = read(ESC_WAIT)
+    if not nxt:
+        return "esc"
+    if nxt == b"\x1b":
+        return "esc"                     # esc pressed twice in a row
+    if nxt == b"[":
+        params = ""
+        for _ in range(SEQ_MAX):
+            ch = read(SEQ_WAIT)
+            if not ch:
+                return ""                # cut off: swallow what we got
+            code = ch[0]
+            if 0x40 <= code <= 0x7E:     # final byte
+                final = chr(code)
+                if final == "M" and not params:
+                    for _ in range(3):   # x10 mouse report: 3 raw bytes
+                        read(SEQ_WAIT)
+                    return ""
+                if final == "~":
+                    return CSI_TILDE_KEYS.get(params.split(";")[0], "")
+                if final in CSI_FINAL_KEYS and not params.startswith(("<", "?")):
+                    return CSI_FINAL_KEYS[final]
+                return ""
+            if not 0x20 <= code <= 0x3F:
+                return ""                # not a csi byte: drop the sequence
+            params += chr(code)
+        return ""
+    if nxt == b"O":
+        ch = read(SEQ_WAIT)
+        if not ch:
+            return ""
+        return SS3_KEYS.get(chr(ch[0]), "")
+    # alt+key arrives as ESC <key>: not a binding anywhere, drop both bytes
+    if nxt[0] >= 0xC0:                   # alt + a multi-byte character
+        need = 1 if nxt[0] < 0xE0 else 2 if nxt[0] < 0xF0 else 3
+        for _ in range(need):
+            read(SEQ_WAIT)
+    return ""
+
+
+def _fd_reader(fd: int) -> Callable[[Optional[float]], bytes]:
+    import select
+
+    def read(timeout: Optional[float]) -> bytes:
+        if timeout is not None and not select.select([fd], [], [], timeout)[0]:
+            return b""
+        raw = os.read(fd, 1)
+        if not raw:
+            raise EOFError("stdin closed")
+        return raw
+    return read
+
+
 def _read_key(fd: int) -> str:
     if is_windows():
         return _read_key_windows()
-    raw = os.read(fd, 1)
-    if not raw:
-        raise EOFError("stdin closed")
-    ch = raw.decode("utf-8", "ignore")
-    if ch != "\x1b":
-        return ch
     import select
-    seq = ""
-    while select.select([fd], [], [], 0.03)[0]:
-        nxt = os.read(fd, 1)
-        if not nxt:
-            break
-        seq += nxt.decode("utf-8", "ignore")
-        if len(seq) >= 2:
-            break
-    return {"[A": "up", "[B": "down", "[C": "right", "[D": "left",
-            "OA": "up", "OB": "down", "OC": "right", "OD": "left"}.get(
-                seq, "esc")
+    read = _fd_reader(fd)
+    while True:
+        # poll so a terminal resize can redraw the screen without a keypress
+        while not select.select([fd], [], [], 0.2)[0]:
+            if SCREEN.resized():
+                return "resize"
+        key = decode_key(read)
+        if key:
+            return key
 
 
 class RawSession:
@@ -4345,6 +4521,7 @@ class RawSession:
     def enter(self) -> None:
         if self.active or not sys.stdin.isatty():
             return
+        _install_exit_guards()
         if is_windows():
             self.active = True
             return
@@ -4361,7 +4538,10 @@ class RawSession:
         if not is_windows():
             import termios
             if self.active and self.saved is not None:
-                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+                try:
+                    termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+                except (termios.error, OSError):
+                    pass             # the tty is gone - nothing to restore
         self.active = False
 
     @contextmanager
@@ -4370,14 +4550,165 @@ class RawSession:
         was_active = self.active
         if was_active:
             self.leave()
+        SCREEN.cursor(True)
         try:
             yield
         finally:
+            SCREEN.cursor(False)
             if was_active:
                 self.enter()
 
 
 TERM = RawSession()
+
+
+class Screen:
+    """the alternate screen buffer, the cursor, and the size of the last frame.
+
+    menus draw on the alternate screen with the cursor hidden, so the shell's
+    scrollback is untouched and comes back exactly as it was on exit.
+    """
+
+    def __init__(self):
+        self.on = False
+        self.hidden = False
+        self.drawn = None        # (cols, rows) the last frame was drawn at
+        self.seen = None         # the size resize detection compares against
+        self.force = False       # redraw on the next key read (after ctrl+z)
+
+    def _write(self, text: str) -> None:
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    def open(self) -> None:
+        if self.on or not sys.stdout.isatty():
+            return
+        _install_exit_guards()
+        self._write("\033[?1049h")
+        self.on = True
+        self.drawn = None
+        self.cursor(False)
+
+    def close(self) -> None:
+        self.cursor(True)
+        if self.on:
+            self._write("\033[?1049l")
+        self.on = False
+        self.drawn = None
+        self.seen = None
+
+    def cursor(self, show: bool) -> None:
+        """hide the cursor while the alternate screen is up, show it for
+        typing and always on the way out"""
+        if show and self.hidden:
+            self._write("\033[?25h")
+            self.hidden = False
+        elif not show and self.on and not self.hidden:
+            self._write("\033[?25l")
+            self.hidden = True
+
+    def resized(self) -> bool:
+        """True once per size change since the last frame (or a resume)"""
+        if self.force:
+            self.force = False
+            return True
+        if self.seen is None:
+            return False
+        size = terminal_size()
+        now = (size.columns, size.lines)
+        if now != self.seen:
+            self.seen = now
+            return True
+        return False
+
+
+SCREEN = Screen()
+
+
+@contextmanager
+def menu_screen():
+    """cbreak + the alternate screen for a stretch of menus; always undone"""
+    was_raw, was_screen = TERM.active, SCREEN.on
+    TERM.enter()
+    SCREEN.open()
+    try:
+        yield
+    finally:
+        if not was_screen:
+            SCREEN.close()
+        if not was_raw:
+            TERM.leave()
+
+
+@contextmanager
+def plain_terminal():
+    """hand the normal screen and a cooked tty to something else - the
+    package manager install (sudo may ask for a password) - then take the
+    menu back exactly as it was"""
+    was_raw, was_screen = TERM.active, SCREEN.on
+    SCREEN.close()
+    TERM.leave()
+    try:
+        yield
+    finally:
+        if was_raw:
+            TERM.enter()
+        if was_screen:
+            SCREEN.open()
+
+
+def restore_terminal() -> None:
+    """normal screen, visible cursor, the tty modes we found. idempotent."""
+    SCREEN.close()
+    TERM.leave()
+
+
+_GUARDS_INSTALLED = False
+
+
+def _install_exit_guards() -> None:
+    """make sure no way out leaves the terminal in cbreak, on the alternate
+    screen or with a hidden cursor: atexit, SIGTERM/SIGHUP, and ctrl+z (which
+    suspends with the terminal restored and redraws on resume)"""
+    global _GUARDS_INSTALLED
+    if _GUARDS_INSTALLED:
+        return
+    _GUARDS_INSTALLED = True
+    import atexit
+    atexit.register(restore_terminal)
+    if is_windows() or threading.current_thread() is not threading.main_thread():
+        return
+    import signal
+
+    def on_terminate(signum, _frame):
+        restore_terminal()
+        raise SystemExit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None and signal.getsignal(sig) == signal.SIG_DFL:
+            signal.signal(sig, on_terminate)
+
+    stop_sig = getattr(signal, "SIGTSTP", None)
+    if stop_sig is None or signal.getsignal(stop_sig) != signal.SIG_DFL:
+        return
+
+    def on_suspend(signum, _frame):
+        was_raw, was_screen = TERM.active, SCREEN.on
+        restore_terminal()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)          # stops here until fg
+        signal.signal(signum, on_suspend)
+        if was_raw:
+            TERM.enter()
+        if was_screen:
+            SCREEN.open()
+        SCREEN.force = True                   # repaint on the next key read
+
+    signal.signal(stop_sig, on_suspend)
 
 
 def read_one_key() -> str:
@@ -4386,6 +4717,8 @@ def read_one_key() -> str:
     inside the menu session the terminal is already in cbreak, so just read.
     outside it (the ffmpeg install prompt, which must leave the tty cooked so
     sudo can ask for a password) take cbreak for exactly this one key.
+
+    may return "resize" when the terminal changed size: screens just redraw.
     """
     if TERM.active or not sys.stdin.isatty():
         return _read_key(0)
@@ -4401,7 +4734,8 @@ def wait_key() -> None:
     if not sys.stdin.isatty():
         return
     try:
-        read_one_key()
+        while read_one_key() == "resize":
+            pass
     except (EOFError, KeyboardInterrupt):
         pass
 
@@ -4418,7 +4752,8 @@ def ask_text(prompt: str, default: str = "") -> Optional[str]:
     return typed or default
 
 
-def ask_yes_no(question: str, default: bool = False) -> bool:
+def ask_yes_no(question: str, default: bool = False,
+               redraw: Optional[Callable] = None) -> bool:
     if not sys.stdin.isatty():
         try:
             raw = input(f"  {question} [y/n]: ").strip().lower()
@@ -4430,12 +4765,19 @@ def ask_yes_no(question: str, default: bool = False) -> bool:
         return raw[0] == "y"
 
     tags = "Y/n" if default else "y/N"
-    sys.stdout.write(f"  {B}{question}{NC} {C_DIM}[{tags}]{NC} ")
+    prompt = f"  {B}{question}{NC} {C_DIM}[{tags}]{NC} "
+    sys.stdout.write(prompt)
     sys.stdout.flush()
     answer = default
     try:
         while True:
             key = read_one_key().lower()
+            if key == "resize":
+                if redraw is not None:
+                    redraw()
+                    sys.stdout.write(prompt)
+                    sys.stdout.flush()
+                continue
             if key in ("\r", "\n"):
                 answer = default
                 break
@@ -4456,38 +4798,91 @@ def ask_yes_no(question: str, default: bool = False) -> bool:
 # frames - one clean screen per state, written in a single pass
 # ---------------------------------------------------------------------------
 
+def frame_room(notice: bool = False) -> int:
+    """body lines that fit under the header and above the footer.
+
+    a frame keeps the terminal's last line free for the cursor (a prompt or
+    the preview progress line goes there), so it never scrolls the screen.
+    """
+    return max(1, term_rows() - 1 - 6 - (2 if notice else 0))
+
+
+def fit_frame(head: list, body: list, notice: list, tail: list,
+              limit: int) -> list:
+    """stack the frame parts into at most `limit` lines.
+
+    the header and the footer always stay; a body that is too tall is cut
+    with a "... N more" line; on a tiny terminal the spacer lines, the notice
+    and the rules go before the header or the footer does.
+    """
+    def fixed() -> int:
+        return len(head) + len(notice) + len(tail)
+
+    if fixed() >= limit:                 # drop spacers first
+        head = [line for line in head if line]
+        tail = [line for line in tail if line]
+        notice = [line for line in notice if line]
+    if fixed() >= limit:
+        notice = []
+    if fixed() > limit:
+        head, tail = head[:1], tail[-1:]
+    room = max(0, limit - fixed())
+    if len(body) > room:
+        if room > 1:
+            hidden = len(body) - room + 1
+            body = body[:room - 1] + [
+                "  " + C_DIM + f"… {hidden} more lines" + NC]
+        else:
+            body = body[:room]
+    return (head + body + notice + tail)[:max(1, limit)]
+
+
 def build_frame(crumb: str, body: list, keys: list, note: str = "",
                 notice: str = "") -> str:
-    """the complete screen. every line fits inside the terminal."""
+    """the complete screen. every line fits inside the terminal, and the
+    frame is never taller than the terminal minus the cursor line."""
     cols = term_cols()
-    width = cols - 4
-    rule = C_DIM + "\u2500" * width + NC
-    left = B + C_FROST + "effex" + NC + C_DIM + " \u203a " + NC + crumb
+    width = max(1, cols - 4)
+    rule = C_DIM + "─" * width + NC
+    left = B + C_FROST + "effex" + NC + C_DIM + " › " + NC + crumb
     right = C_DIM + (note or f"v{VERSION}") + NC
-    gap = width - vlen(left) - vlen(right)
-    if gap < 2:
+    if vlen(left) + 2 + vlen(right) > width:
         right = ""
-        gap = max(1, width - vlen(left))
-    head = "  " + left + " " * gap + right
-    lines = [head, "  " + rule, ""]
-    lines += body
-    if notice:
-        lines.append("")
-        lines.append("  " + trunc(notice, width - 2))
-    lines.append("")
-    lines.append("  " + rule)
+    left = clip_visible(left, width)
+    gap = max(0, width - vlen(left) - vlen(right))
+    head = ["  " + left + " " * gap + right, "  " + rule, ""]
+    notice_lines = (["", "  " + clip_visible(notice, width - 2)] if notice
+                    else [])
     footer = "   ".join(keys)
-    lines.append("  " + C_DIM + trunc(footer, width) + NC)
-    return "\n".join(lines)
+    tail = ["", "  " + rule, "  " + C_DIM + trunc(footer, width) + NC]
+    lines = fit_frame(head, list(body), notice_lines, tail,
+                      max(1, term_rows() - 1))
+    return "\n".join(clip_visible(line, cols - 1) for line in lines)
 
 
 def draw(frame: str) -> None:
-    """home the cursor, draw the frame, wipe whatever is left under it"""
+    """home the cursor, draw the frame, wipe whatever is left under it.
+
+    every line clears to its end, so a longer line from the previous screen
+    never shows through; a size change clears the whole screen first. the
+    frame is clipped to the terminal and the cursor ends on the line below
+    it, so drawing never scrolls.
+    """
     if not sys.stdout.isatty():
         _say(frame)
         return
-    sys.stdout.write("\033[H" + frame + "\n\033[J")
+    size = terminal_size()
+    cols, rows = max(1, size.columns), max(1, size.lines)
+    lines = frame.split("\n")
+    limit = max(1, rows - 1)
+    if len(lines) > limit:
+        lines = (lines[:limit - 2] + lines[-2:]) if limit > 3 \
+            else lines[:limit]
+    lines = [clip_visible(line, cols - 1) for line in lines]
+    home = "\033[H" if SCREEN.drawn == (cols, rows) else "\033[2J\033[H"
+    sys.stdout.write(home + "\033[K\n".join(lines) + "\033[K\n\033[J")
     sys.stdout.flush()
+    SCREEN.drawn = SCREEN.seen = (cols, rows)
 
 
 def start_frame(title: str, body: list, keys: list, note: str = "",
@@ -4495,19 +4890,76 @@ def start_frame(title: str, body: list, keys: list, note: str = "",
     draw(build_frame(title, body, keys, note=note, notice=notice))
 
 
+def _keep_highlight(match) -> str:
+    """after a reset inside a highlighted row, switch the bar back on"""
+    code = match.group()
+    params = code[2:-1].split(";")
+    if "" in params or "0" in params:
+        return code + REV + B
+    return code
+
+
 def row(text: str, selected: bool) -> str:
     """a list row.
 
     padded to the same width whether or not it is highlighted: that keeps the
-    columns lined up and lets the reverse bar cover a whole row.
+    columns lined up and lets the reverse bar cover a whole row - colours
+    inside the row end with a reset, so the bar is switched back on after
+    each one instead of stopping at the first coloured word.
     """
-    width = term_cols() - 4
+    width = max(1, term_cols() - 4)
     if vlen(text) > width:
-        text = trunc(text, width)
+        text = clip_visible(text, width)
     text = pad(text, width)
     if selected:
+        if REV:
+            text = _ANSI_RE.sub(_keep_highlight, text)
         return "  " + REV + B + text + NC + REV_OFF
     return "  " + text
+
+
+def list_page(count: int, room: int) -> int:
+    """how many list rows fit in `room` body lines, leaving one for the
+    "… N more" line when the list does not fit"""
+    room = max(1, room)
+    if count <= room:
+        return max(1, count)
+    return max(1, room - 1)
+
+
+def scroll_top(idx: int, top: int, page: int, count: int) -> int:
+    """first visible row: keeps the cursor on screen, and after the terminal
+    grows it scrolls back so no empty space is left under the list"""
+    top = max(0, min(top, count - page))
+    if idx < top:
+        top = idx
+    elif idx >= top + page:
+        top = idx - page + 1
+    return max(0, top)
+
+
+def nav_index(key: str, idx: int, count: int, page: int) -> Optional[int]:
+    """the new cursor for a movement key, None for any other key.
+
+    up/down wrap around; home/end jump to the ends and pgup/pgdn move a page
+    without wrapping. an empty list never moves.
+    """
+    if count <= 0:
+        return idx if key in ("up", "k", "down", "j", "home", "end",
+                              "pgup", "pgdn") else None
+    if key in ("up", "k"):
+        return (idx - 1) % count
+    if key in ("down", "j"):
+        return (idx + 1) % count
+    if key == "home":
+        return 0
+    if key == "end":
+        return count - 1
+    if key == "pgup":
+        return max(0, idx - max(1, page))
+    if key == "pgdn":
+        return min(count - 1, idx + max(1, page))
+    return None
 
 
 def multi_pick(crumb: str, param: Param, current: list) -> Optional[list]:
@@ -4517,14 +4969,13 @@ def multi_pick(crumb: str, param: Param, current: list) -> Optional[list]:
         return current
     picked = [v for v in current if v in (c for c, _l, _h in param.choices)]
     items = [(v, lbl, hint) for v, lbl, hint in param.choices]
+    if not items:
+        return current
     idx, top = 0, 0
-    page = max(4, term_rows() - 8)
 
     while True:
-        if idx < top:
-            top = idx
-        elif idx >= top + page:
-            top = idx - page + 1
+        page = list_page(len(items), frame_room())
+        top = scroll_top(idx, top, page, len(items))
         visible = items[top:top + page]
         body = []
         for n, (v, lbl, hint) in enumerate(visible):
@@ -4545,10 +4996,9 @@ def multi_pick(crumb: str, param: Param, current: list) -> Optional[list]:
             key = read_one_key()
         except EOFError:
             return None
-        if key in ("up", "k"):
-            idx = (idx - 1) % len(items)
-        elif key in ("down", "j"):
-            idx = (idx + 1) % len(items)
+        moved = nav_index(key, idx, len(items), page)
+        if moved is not None:
+            idx = moved
         elif key == " ":
             v = items[idx][0]
             picked = ([x for x in picked if x != v] if v in picked
@@ -4603,19 +5053,22 @@ def select(crumb: str, items: list, row_fn: Callable, keys: list,
         return _select_numbered(crumb, items)
 
     idx, top = 0, 0
-    page = (max(1, term_rows() - 8 - len(intro)) if intro
-            else max(4, term_rows() - 8))
 
     while True:
-        if idx < top:
-            top = idx
-        elif idx >= top + page:
-            top = idx - page + 1
+        # sized every pass: a resized terminal gets a list that fits it
+        room = frame_room(bool(notice))
+        lead = list(intro or [])
+        if lead and room - len(lead) < min(len(items), 3):
+            lead = []                    # a short terminal keeps the list
+        page = list_page(len(items), room - len(lead))
+        top = scroll_top(idx, top, page, len(items))
         visible = items[top:top + page]
-        body = [row(line, False) for line in (intro or [])] + [
+        body = [row(line, False) for line in lead] + [
             row_fn(item, top + n, (top + n) == idx)
             for n, item in enumerate(visible)
         ]
+        if not items:
+            body.append("  " + C_DIM + "nothing to pick here" + NC)
         if len(items) > page:
             body.append("  " + C_DIM
                         + f"\u2026 {len(items) - top - len(visible)} more" + NC)
@@ -4630,12 +5083,12 @@ def select(crumb: str, items: list, row_fn: Callable, keys: list,
         except EOFError:
             return None
 
-        if key in ("up", "k"):
-            idx = (idx - 1) % len(items)
-        elif key in ("down", "j"):
-            idx = (idx + 1) % len(items)
+        moved = nav_index(key, idx, len(items), page)
+        if moved is not None:
+            idx = moved
         elif key in ("\r", "\n", " "):
-            return items[idx].value
+            if items:
+                return items[idx].value
         elif key in ("q", "esc", "\x03"):
             return None
         elif extra and key in extra:
@@ -4647,7 +5100,7 @@ def select(crumb: str, items: list, row_fn: Callable, keys: list,
                 idx = min(idx, len(items) - 1)
         elif key.isdigit() and 1 <= int(key) <= min(9, len(items)):
             return items[int(key) - 1].value
-        elif jump and key in jump:
+        elif jump and key in jump and jump[key] < len(items):
             return items[jump[key]].value
 
 
@@ -4726,6 +5179,54 @@ def screen_main(tools: Tools, args) -> str:
 
 
 
+def show_page(crumb: str, body: list, keys: list, note: str = "") -> None:
+    """a read-only screen held until a key.
+
+    a body taller than the terminal scrolls with the arrows, pgup/pgdn and
+    home/end instead of running off the screen; a resize redraws it; any
+    other key goes back.
+    """
+    if not sys.stdin.isatty():
+        start_frame(crumb, body, keys, note=note)
+        return
+    top = 0
+    while True:
+        room = frame_room()
+        scrolls = len(body) > room
+        if scrolls:
+            page = max(1, room - 1)
+            top = max(0, min(top, len(body) - page))
+            shown = body[top:top + page] + ["  " + C_DIM + (
+                f"lines {top + 1}-{min(len(body), top + page)} of "
+                f"{len(body)}  (\u2191\u2193 scroll)") + NC]
+            footer = ["\u2191\u2193 scroll"] + keys
+        else:
+            page, top, shown, footer = len(body), 0, body, keys
+        start_frame(crumb, shown, footer, note=note)
+        try:
+            key = read_one_key()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if key == "resize":
+            continue
+        if not scrolls:
+            return
+        if key in ("up", "k"):
+            top -= 1
+        elif key in ("down", "j"):
+            top += 1
+        elif key == "pgup":
+            top -= page
+        elif key == "pgdn":
+            top += page
+        elif key == "home":
+            top = 0
+        elif key == "end":
+            top = len(body)
+        else:
+            return
+
+
 def screen_help(args) -> None:
     width = term_cols() - 6
     body = [
@@ -4749,8 +5250,8 @@ def screen_help(args) -> None:
         kv("folders", f"{INPUT_DIR.name}/ in, {OUTPUT_DIR.name}/ out", 12),
         kv("", "EFFEX_INPUT_DIR / EFFEX_OUTPUT_DIR override both", 12),
     ]
-    start_frame("help", [trunc(line, width) for line in body], ["enter back"])
-    wait_key()
+    show_page("help", [clip_visible(line, width) for line in body],
+              ["enter back"])
 
 
 def screen_effects_info(args) -> None:
@@ -4775,18 +5276,24 @@ def screen_effects_info(args) -> None:
                 "effect" + NC)
     body.append("  " + C_DIM + "space chains effects: 1, 2, 3 is the order "
                 "they run in" + NC)
-    start_frame("effects", [trunc(line, width) for line in body],
-                ["enter back"])
-    wait_key()
+    show_page("effects", [clip_visible(line, width) for line in body],
+              ["enter back"])
 
 
 def screen_check(tools: Tools, interactive: bool) -> Tools:
     width = term_cols() - 6
     reqs = check_requirements(tools)
     if missing_requirements(reqs):
-        TERM.leave()
-        tools = install_requirements(tools, interactive)
-        TERM.enter()
+        # the installer gets the normal screen and a cooked tty (sudo may ask
+        # for a password); hold its output until a key so nothing it said is
+        # wiped by the next frame
+        with plain_terminal():
+            tools = install_requirements(tools, interactive)
+            if interactive and sys.stdin.isatty():
+                _say()
+                _say("  " + C_DIM + "press any key to go back to the menu"
+                     + NC)
+                wait_key()
         reqs = check_requirements(tools)
     body = requirement_lines(reqs, width)
     hint_line = pip_hint(reqs)
@@ -4802,9 +5309,8 @@ def screen_check(tools: Tools, interactive: bool) -> Tools:
         body.append("  " + C_GRN + "\u2713" + NC + " " + fit(folder.name, 8)
                     + C_DIM + trunc(str(folder), width - 24) + NC
                     + f"   {count} file{'' if count == 1 else 's'}")
-    start_frame("requirements", body, ["enter back"],
-                note=requirement_summary(reqs))
-    wait_key()
+    show_page("requirements", body, ["enter back"],
+              note=requirement_summary(reqs))
     return tools
 
 
@@ -4833,6 +5339,8 @@ def screen_pick_video(tools: Tools) -> Optional[Path]:
                 key = read_one_key()
             except (EOFError, KeyboardInterrupt):
                 return None
+            if key == "resize":
+                continue
             if key == "r":
                 items = build()
                 if items:
@@ -4903,7 +5411,6 @@ def screen_pick_effects(clip: Clip) -> Optional[Chain]:
     idx, top = 0, 0
     order: list = []
     notice = ""
-    page = max(4, term_rows() - 8)
 
     def marked(effect: Effect) -> str:
         if effect not in order:
@@ -4915,6 +5422,15 @@ def screen_pick_effects(clip: Clip) -> Optional[Chain]:
                    if start <= effect_index)
 
     while True:
+        chain_note = (C_DIM + "chain " + NC + C_FROST
+                      + " \u2192 ".join(e.name for e in order) + NC
+                      + C_DIM + f"   {len(order)} effect"
+                      + ("" if len(order) == 1 else "s") + NC) if order else ""
+        banner = "   ".join(part for part in (chain_note, notice) if part)
+        # sized every pass: the chain banner takes two lines when it shows,
+        # and a resized terminal gets a list that fits it
+        page = list_page(len(visual_rows), frame_room(bool(banner)))
+        top = max(0, min(top, len(visual_rows) - page))
         selected_row = selectable_positions[idx]
         anchor = selected_row - 1 if idx in group_starts else selected_row
         if anchor < top:
@@ -4938,11 +5454,6 @@ def screen_pick_effects(clip: Clip) -> Optional[Chain]:
             body.append("  " + C_DIM
                         + f"\u2026 {len(visual_rows) - top - len(visible)} more rows"
                         + NC)
-        chain_note = (C_DIM + "chain " + NC + C_FROST
-                      + " \u2192 ".join(e.name for e in order) + NC
-                      + C_DIM + f"   {len(order)} effect"
-                      + ("" if len(order) == 1 else "s") + NC) if order else ""
-        banner = "   ".join(part for part in (chain_note, notice) if part)
         draw(build_frame("pick an effect", body,
                          ["\u2191\u2193 move", "[/] group", "1-9 pick",
                           "space chain", "enter ok", "c clear", "q videos"],
@@ -4951,11 +5462,12 @@ def screen_pick_effects(clip: Clip) -> Optional[Chain]:
             key = read_one_key()
         except EOFError:
             return None
+        if key == "resize":
+            continue
         notice = ""
-        if key in ("up", "k"):
-            idx = (idx - 1) % len(grouped_effects)
-        elif key in ("down", "j"):
-            idx = (idx + 1) % len(grouped_effects)
+        moved = nav_index(key, idx, len(grouped_effects), page)
+        if moved is not None:
+            idx = moved
         elif key in ("[", "{"):
             idx = group_starts[(group_for(idx) - 1) % len(group_starts)]
         elif key in ("]", "}"):
@@ -5144,6 +5656,8 @@ def screen_effect_options(chain: Chain, clip: Clip, tools: Tools, args,
             key = read_one_key()
         except EOFError:
             return None
+        if key == "resize":
+            continue
         notice = ""
 
         if key == "r":
@@ -5283,9 +5797,12 @@ def screen_confirm(chain: Chain, clip: Clip, args, opts: dict) -> bool:
     ]
     for note in plan.notes:
         body.append("  " + C_DIM + "\u00b7 " + trunc(note, width - 4) + NC)
-    draw(build_frame("confirm", body, ["y render", "n back"],
-                     note=f"{chain.name} \u00b7 {clip.res}"))
-    return ask_yes_no("render this video?", default=True)
+    def redraw() -> None:
+        draw(build_frame("confirm", body, ["y render", "n back"],
+                         note=f"{chain.name} \u00b7 {clip.res}"))
+
+    redraw()
+    return ask_yes_no("render this video?", default=True, redraw=redraw)
 
 
 def open_folder(path: Path) -> bool:
@@ -5368,53 +5885,72 @@ def interactive_menu(args) -> int:
         err("cannot continue without ffmpeg")
         return 1
 
-    TERM.enter()
     try:
-        while True:
-            choice = screen_main(tools, args)
-            if choice == "quit":
-                return 0
-            if choice == "help":
-                screen_help(args)
-            elif choice == "effects":
-                screen_effects_info(args)
-            elif choice == "check":
-                tools = screen_check(tools, interactive=True)
-            elif choice == "process":
-                clip_path = screen_pick_video(tools)
-                if clip_path is None:
-                    continue
-                clip = probe(clip_path, tools)
-                chain = screen_pick_effects(clip)
-                if chain is None:
-                    continue
-                opts = None
-                notice = ""
-                while True:
-                    opts = screen_effect_options(chain, clip, tools, args,
-                                                 preset_opts=opts,
-                                                 initial_notice=notice)
-                    if opts is None:
-                        break
-                    input_problem = validate_datamosh_inputs(
-                        chain, opts, [clip.path], args, tools)
-                    if input_problem:
-                        notice = C_AMB + input_problem + NC
-                        continue
-                    if screen_confirm(chain, clip, args, opts):
-                        last_render.clear()
-                        rendered = process(chain, clip, tools, args,
-                                           opts_override=opts)
-                        screen_done(args, rendered)
-                        break
-                    notice = (C_AMB + "nothing was rendered - y renders, "
-                              "n came back here so you can change options"
-                              + NC)
+        with menu_screen():
+            return _menu_loop(tools, args)
     except (KeyboardInterrupt, EOFError):
-        _say()
         return 0
     finally:
-        TERM.leave()
+        restore_terminal()
+
+
+def _menu_loop(tools: Tools, args) -> int:
+    while True:
+        choice = screen_main(tools, args)
+        if choice == "quit":
+            return 0
+        if choice == "help":
+            screen_help(args)
+        elif choice == "effects":
+            screen_effects_info(args)
+        elif choice == "check":
+            tools = screen_check(tools, interactive=True)
+        elif choice == "process":
+            _process_flow(tools, args)
+
+
+def _process_flow(tools: Tools, args) -> None:
+    """video -> effect -> options -> confirm -> render.
+
+    q backs out one screen at a time, as the footers say: options go back to
+    the effect picker, the effect picker to the video list, the video list to
+    the main menu. a finished render goes to the main menu.
+    """
+    while True:
+        clip_path = screen_pick_video(tools)
+        if clip_path is None:
+            return
+        clip = probe(clip_path, tools)
+        while True:
+            chain = screen_pick_effects(clip)
+            if chain is None:
+                break                            # back to the video list
+            opts = None
+            notice = ""
+            while True:
+                opts = screen_effect_options(chain, clip, tools, args,
+                                             preset_opts=opts,
+                                             initial_notice=notice)
+                if opts is None:
+                    break                        # back to the effect picker
+                input_problem = validate_datamosh_inputs(
+                    chain, opts, [clip.path], args, tools)
+                if input_problem:
+                    notice = C_AMB + input_problem + NC
+                    if not chain.rows:
+                        break                    # no options screen to show it
+                    continue
+                if screen_confirm(chain, clip, args, opts):
+                    last_render.clear()
+                    rendered = process(chain, clip, tools, args,
+                                       opts_override=opts)
+                    screen_done(args, rendered)
+                    return
+                if not chain.rows:
+                    break        # nothing to change: n goes back to effects
+                notice = (C_AMB + "nothing was rendered - y renders, "
+                          "n came back here so you can change options"
+                          + NC)
 
 
 # ---------------------------------------------------------------------------
@@ -5707,11 +6243,8 @@ def cmd_run(args, tools: Tools) -> int:
         if not sys.stdin.isatty():
             err("no input files given and stdin is not a terminal")
             return 2
-        TERM.enter()
-        try:
+        with menu_screen():
             path = screen_pick_video(tools)
-        finally:
-            TERM.leave()
         if path is None:
             return 0
         targets = [path]

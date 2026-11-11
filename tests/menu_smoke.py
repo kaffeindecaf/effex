@@ -534,9 +534,9 @@ def scenario_newkinds(c: Checker):
     c.check("right arrow steps the fractional period",
             "2*PI*t/6.5" in d.text())
     d.send(b"q")
-    d.pump(0.5)                                    # options -> main menu
-    d.send(b"p")
-    d.pump(0.5)                                    # main menu -> video picker
+    d.pump(0.5)                                    # options -> effect picker
+    d.send(b"q")
+    d.pump(0.5)                                    # effect picker -> video picker
     d.send(ENTER)
     d.pump(0.5)                                    # video picker -> effect picker
     next_effect_group(d)                           # color & texture
@@ -549,12 +549,9 @@ def scenario_newkinds(c: Checker):
     d.send(b"55%\r")
     c.check("typed percent is applied",
             d.wait_for("55%") and "55%" in d.text())
-    d.send(b"q")
-    d.pump(0.5)
-    d.send(b"q")
-    d.pump(0.5)
-    d.send(b"q")
-    d.pump(0.5)
+    for _ in range(4):                             # options, effects, videos, main
+        d.send(b"q")
+        d.pump(0.5)
     rc = d.expect_exit(6)
     c.check(f"second session exits cleanly (rc={rc})", rc == 0)
     d.close()
@@ -1063,11 +1060,17 @@ def scenario_archaeology(c: Checker):
         d.send(b"r")
         c.check("archaeology confirm opens", wait_last(d, "render this video?"))
         d.send(ENTER)
-        c.check("archaeology menu render finishes", wait_last(d, "wrote", timeout=30))
-        output = newest_mp4(out_dir)
-        c.check("archaeology menu render preserves dimensions and audio",
-                output is not None and video_dims(output) == (160, 96)
-                and audio_codec(output) == "aac")
+        if importlib.util.find_spec("av") is None:
+            # without PyAV the render must stop early and name the install
+            c.check("archaeology without PyAV names the requirement",
+                    wait_last(d, "requirements-inversion.txt", timeout=30))
+        else:
+            c.check("archaeology menu render finishes",
+                    wait_last(d, "wrote", timeout=30))
+            output = newest_mp4(out_dir)
+            c.check("archaeology menu render preserves dimensions and audio",
+                    output is not None and video_dims(output) == (160, 96)
+                    and audio_codec(output) == "aac")
         d.send(ENTER)
         wait_last(d, "main menu")
         d.send(b"q")
@@ -1076,11 +1079,185 @@ def scenario_archaeology(c: Checker):
         d.close()
 
 
+PGUP = b"\x1b[5~"
+PGDN = b"\x1b[6~"
+HOME = b"\x1b[1~"
+HOME_XTERM = b"\x1b[H"
+END = b"\x1b[4~"
+F5 = b"\x1b[15~"
+CTRL_UP = b"\x1b[1;5A"
+F1 = b"\x1bOP"
+RESTORED = "\033[?25h\033[?1049l"
+
+
+def frame_lines(frame: str) -> list:
+    """the lines of one frame as drawn: up to the erase-below that ends it"""
+    return frame.split("\033[J")[0].rstrip("\r\n").split("\n")
+
+
+def scenario_long_keys(c: Checker):
+    """PgUp, Home, F-keys and friends neither go back nor quick-pick.
+
+    the old reader took ESC plus two bytes: ESC [ 5 ~ became "esc" (back - it
+    quit from the main menu) and the stray "~" stayed in the buffer; F5 is
+    ESC [ 1 5 ~, which left a "5" behind that quick-picked effect five.
+    """
+    in_dir, out_dir = temp_folders()
+    make_clip(in_dir / "clip.mp4", seconds=1)
+    d = start(env_for(in_dir, out_dir))
+    try:
+        d.wait_for("main menu")
+        for key in (PGUP, PGDN, HOME, HOME_XTERM, END, F5, CTRL_UP, F1):
+            d.send(key)
+        c.check("long escape sequences do not leave the main menu",
+                d.proc.poll() is None and "main menu" in last_frame(d))
+        # home/end move the highlight: end then enter picks the last row
+        d.send(b"\x1b[F")
+        d.send(HOME)
+        d.send(ENTER)
+        c.check("home lands on the first main menu row (process a video)",
+                wait_last(d, "pick a video"))
+        d.send(ENTER)
+        c.check("effect picker opens", wait_last(d, "pick an effect"))
+        for key in (F5, PGUP, HOME, b"\x1b[15;2~", b"\x1b[3~"):
+            d.send(key)
+        header = last_frame(d).split("\n")[0]
+        c.check("F5 / PgUp / Home / Delete stay in the effect picker",
+                "pick an effect" in header, header)
+        d.send(b"q")
+        c.check("q still goes back after the long keys",
+                wait_last(d, "pick a video"))
+        d.send(b"q")
+        d.send(b"q")
+        rc = d.expect_exit(6)
+        c.check(f"clean exit after long keys (rc={rc})", rc == 0)
+        c.check("no traceback after long keys", "Traceback" not in d.text())
+    finally:
+        d.close()
+
+
+def scenario_small_terminal(c: Checker):
+    """a short terminal: every frame fits, nothing scrolls, resize redraws"""
+    in_dir, out_dir = temp_folders()
+    for name in "abcdefghijkl":
+        make_clip(in_dir / f"{name}.mp4", seconds=1)
+    rows, cols = 12, 50
+    d = PtyDriver([sys.executable, str(EFFEX)], rows=rows, cols=cols,
+                  env_extra=env_for(in_dir, out_dir), timeout=8)
+    try:
+        c.check("menu comes up in a 50x12 terminal", d.wait_for("main menu"))
+        tall = len(frame_lines(last_frame(d)))
+        c.check("main menu fits 12 rows with the cursor line free",
+                tall <= rows - 1, str(tall))
+        c.check("the main menu rows survive a short terminal",
+                "process a video" in last_frame(d)
+                and "quit" in last_frame(d))
+        d.send(b"p")
+        wait_last(d, "pick a video")
+        tall = len(frame_lines(last_frame(d)))
+        c.check("12-video list fits 12 rows", tall <= rows - 1, str(tall))
+        for _ in range(11):
+            d.send(b"j", pause=0.05)
+        d.pump(0.5)
+        c.check("scrolling to the last video keeps it on screen",
+                "l.mp4" in last_frame(d))
+        d.send(ENTER)
+        wait_last(d, "pick an effect")
+        d.send(b" ")                              # chain banner: two lines
+        d.send(b"j")
+        d.send(b" ")
+        tall = len(frame_lines(last_frame(d)))
+        c.check("effect picker with the chain banner fits 12 rows",
+                tall <= rows - 1 and "chain" in last_frame(d), str(tall))
+        before = d.text().count("\033[2J")
+        d.resize(9, 40)
+        d.pump(1.0)
+        frame = last_frame(d)
+        c.check("a resize redraws without a keypress",
+                d.text().count("\033[2J") > before, repr(frame[:60]))
+        tall = len(frame_lines(frame))
+        c.check("the redrawn frame fits the new 9 rows", tall <= 8, str(tall))
+        widest = max(len(line.rstrip("\r")) for line in
+                     [__import__("re").sub(r"\033\[[0-9;?]*[A-Za-z]", "", x)
+                      for x in frame_lines(frame)])
+        c.check("the redrawn frame fits the new 40 columns", widest <= 40,
+                str(widest))
+        c.check("the chain survives the resize", "chain" in frame)
+        d.send(b"q")
+        c.check("q in the effect picker goes back to the video list",
+                wait_last(d, "pick a video"))
+        d.send(b"q")
+        c.check("q in the video list goes back to the main menu",
+                wait_last(d, "main menu"))
+        d.send(b"?")
+        c.check("help opens on a tiny terminal",
+                wait_last(d, "\u203a help"))
+        tall = len(frame_lines(last_frame(d)))
+        c.check("help fits 9 rows and scrolls instead", tall <= 8
+                and "scroll" in last_frame(d), str(tall))
+        d.send(DOWN)
+        c.check("down scrolls the help instead of closing it",
+                "help" in last_frame(d).split("\n")[0])
+        d.send(ENTER)
+        c.check("enter closes the help", wait_last(d, "main menu"))
+        d.send(b"q")
+        rc = d.expect_exit(6)
+        c.check(f"small terminal: clean exit (rc={rc})", rc == 0)
+        c.check("small terminal: no traceback", "Traceback" not in d.text())
+    finally:
+        d.close()
+
+
+def scenario_terminal_restored(c: Checker):
+    """q, ctrl+c and SIGTERM all leave the terminal as it was found"""
+    import signal
+    in_dir, out_dir = temp_folders()
+    make_clip(in_dir / "clip.mp4", seconds=1)
+    env = env_for(in_dir, out_dir)
+    for how in ("q", "ctrl+c", "SIGTERM", "ctrl+c in options"):
+        d = PtyDriver([sys.executable, str(EFFEX)], rows=30, cols=100,
+                      env_extra=env, timeout=8, controlling=True)
+        try:
+            d.wait_for("main menu")
+            c.check(f"{how}: menu runs on the alternate screen, cursor hidden",
+                    d.text().startswith("\033[?1049h\033[?25l"))
+            c.check(f"{how}: menu holds the tty in cbreak without echo",
+                    d.tty_modes() == (False, False), str(d.tty_modes()))
+            if how == "q":
+                d.send(b"q")
+            elif how == "ctrl+c":
+                d.send(b"\x03")
+            elif how == "SIGTERM":
+                d.proc.send_signal(signal.SIGTERM)
+            else:
+                d.send(b"p")
+                wait_last(d, "pick a video")
+                d.send(ENTER)
+                wait_last(d, "pick an effect")
+                d.send(ENTER)
+                wait_last(d, "options")
+                d.send(b"\x03")
+            rc = d.expect_exit(6)
+            d.pump(0.3)
+            c.check(f"{how}: exits (rc={rc})", rc is not None)
+            c.check(f"{how}: normal screen and cursor are back",
+                    d.text().rstrip("\r\n").endswith(RESTORED)
+                    or d.text().rfind(RESTORED) > d.text().rfind("\033[J"),
+                    repr(d.text()[-40:]))
+            c.check(f"{how}: tty is canonical with echo again",
+                    d.tty_modes() == (True, True), str(d.tty_modes()))
+            c.check(f"{how}: no traceback", "Traceback" not in d.text())
+        finally:
+            d.close()
+
+
 def main() -> int:
     c = Checker("menu smoke")
     if not require_tools(c):
         return 0
-    for scenario in (scenario_render_flow, scenario_options_menu,
+    for scenario in (scenario_long_keys, scenario_small_terminal,
+                     scenario_terminal_restored,
+                     scenario_render_flow, scenario_options_menu,
                      scenario_pixelize, scenario_wobble, scenario_preview,
                      scenario_decline, scenario_datamosh,
                      scenario_datamosh_second, scenario_newkinds,

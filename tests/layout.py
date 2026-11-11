@@ -6,7 +6,9 @@ of the pty stream and measure them:
 
   - nothing may be wider than the terminal (a wrapped line is what leaves
     artifacts behind on the next redraw)
-  - the screen must be cleared before the first frame is drawn
+  - the menu runs on the alternate screen, cleared before the first frame
+  - every frame line clears to its end, so a longer line of the previous
+    screen never shows through
   - list rows must all be the same width so columns line up
   - a frame must not move the cursor itself (no cursor-up tricks inside it)
 
@@ -22,7 +24,8 @@ from harness import (Checker, EFFEX, env_for, make_clip,  # noqa: E402
                      require_tools, temp_folders)
 from pty_driver import PtyDriver  # noqa: E402
 
-SGR = re.compile(r"\033\[[0-9;]*m")
+# colours, and erase-to-end-of-line: neither takes a cell on screen
+SGR = re.compile(r"\033\[[0-9;]*[mK]")
 ENTER = b"\r"
 
 # sizes to check: narrow/wide scaling, the classic 80x24, and something wide
@@ -88,7 +91,10 @@ def check_frame(c: Checker, label: str, frame: str, cols: int) -> None:
     c.check(f"{label}: no tabs in the frame", "\t" not in frame)
     c.check(f"{label}: frame does not move the cursor itself",
             not any(code in frame for code in ("\033[1A", "\033[2J",
-                                               "\033[K", "\033[A")))
+                                               "\033[A")))
+    c.check(f"{label}: every line clears to its end",
+            all(line.rstrip("\r").endswith("\033[K") for line in body),
+            repr([line[-12:] for line in body][:3]))
     c.check(f"{label}: has a header and a footer rule",
             plain_of(frame).count("\u2500" * 10) >= 2)
 
@@ -108,8 +114,10 @@ def scenario_sizes(c: Checker) -> None:
     for cols, rows in SIZES:
         d = scenario_fit(c, cols, rows)
         stream = d.text()
-        c.check(f"{cols}x{rows}: screen is cleared before the first frame",
-                stream.startswith("\033[H"), repr(stream[:24]))
+        c.check(f"{cols}x{rows}: menu takes the alternate screen, cursor "
+                "hidden, cleared before the first frame",
+                stream.startswith("\033[?1049h\033[?25l\033[2J\033[H"),
+                repr(stream[:24]))
 
         menu = frame_with(stream, "main menu")
         check_frame(c, f"{cols}x{rows} main menu", menu, cols)
@@ -179,10 +187,284 @@ def scenario_columns(c: Checker) -> None:
     d.close()
 
 
+# ---------------------------------------------------------------------------
+# pure-function checks: key decoding, frame clipping, highlight, widths
+# ---------------------------------------------------------------------------
+
+def load_effex():
+    import importlib
+    sys.path.insert(0, str(EFFEX.parent))
+    return importlib.import_module("effex")
+
+
+def keys_from(fx, data: bytes) -> list:
+    """every key the decoder reads out of a byte stream, swallowed ones
+    (empty strings) dropped the way _read_key drops them"""
+    buf = list(data)
+
+    def read(timeout):
+        if not buf:
+            if timeout is None:
+                raise EOFError
+            return b""
+        return bytes([buf.pop(0)])
+
+    out = []
+    try:
+        while True:
+            key = fx.decode_key(read)
+            if key:
+                out.append(key)
+    except EOFError:
+        pass
+    return out
+
+
+def sized(fx, cols: int, rows: int):
+    """pin the terminal size the frame builders see"""
+    fx.terminal_size = lambda: __import__("os").terminal_size((cols, rows))
+
+
+def unit_key_decoding(c: Checker, fx) -> None:
+    cases = [
+        (b"\x1b[5~", ["pgup"]), (b"\x1b[6~", ["pgdn"]),
+        (b"\x1b[H", ["home"]), (b"\x1b[F", ["end"]),
+        (b"\x1b[1~", ["home"]), (b"\x1b[4~", ["end"]),
+        (b"\x1b[7~", ["home"]), (b"\x1b[8~", ["end"]),
+        (b"\x1bOH", ["home"]), (b"\x1bOF", ["end"]),
+        (b"\x1b[3~", ["delete"]),
+        (b"\x1b[A", ["up"]), (b"\x1bOB", ["down"]),
+        (b"\x1b[1;5A", ["up"]), (b"\x1b[1;2C", ["right"]),
+        (b"\x1b[5;5~", ["pgup"]),
+        (b"\x1bOP", []), (b"\x1b[15~", []), (b"\x1b[24~", []),
+        (b"\x1b[15~5", ["5"]),            # the 5 after F5 is a real key
+        (b"\x1b[5~~", ["pgup", "~"]),
+        (b"\x1b[<0;12;7M", []),           # sgr mouse report
+        (b"\x1b[M !!x", ["x"]),           # x10 mouse report: 3 raw bytes
+        (b"\x1b[200~", []),               # bracketed paste marker
+        (b"\x1b", ["esc"]), (b"\x1b\x1b", ["esc"]),
+        (b"\x1bx", []),                   # alt+x: not a binding
+        (b"q\r ", ["q", "\r", " "]),
+        ("é".encode(), ["é"]), ("日本".encode(), ["日", "本"]),
+        ("🎬".encode() + b"j", ["🎬", "j"]),
+    ]
+    for data, want in cases:
+        got = keys_from(fx, data)
+        c.check(f"key decode {data!r} -> {want}", got == want, str(got))
+    c.check("no long sequence decodes as esc (go back)",
+            all("esc" not in keys_from(fx, d) for d in
+                (b"\x1b[5~", b"\x1b[15~", b"\x1bOP", b"\x1b[1;5D")))
+    c.check("windows key names unchanged",
+            fx.decode_windows_key("\xe0", "I") == "pgup"
+            and fx.decode_windows_key("\x00", "H") == "up"
+            and fx.decode_windows_key("\x1b") == "esc"
+            and fx.decode_windows_key("q") == "q")
+
+
+def unit_frames(c: Checker, fx) -> None:
+    fx.apply_palette(True)
+    body = [f"  line {n}" for n in range(60)]
+    for cols, rows in ((80, 24), (40, 10), (30, 6), (20, 3)):
+        sized(fx, cols, rows)
+        out = fx.build_frame("pick a video", body, ["q back"],
+                             notice="a notice")
+        frame = out.split("\n")
+        c.check(f"{cols}x{rows}: tall body clipped to rows-1",
+                len(frame) <= rows - 1 or (rows < 3 and len(frame) == 1),
+                f"{len(frame)} lines")
+        c.check(f"{cols}x{rows}: header kept on top",
+                "effex" in plain_of(frame[0]))
+        c.check(f"{cols}x{rows}: footer kept at the bottom",
+                "q back" in plain_of(frame[-1]))
+        c.check(f"{cols}x{rows}: no line wider than the terminal",
+                max(vis(line) for line in frame) < cols,
+                str(max(vis(line) for line in frame)))
+    sized(fx, 80, 24)
+    out = fx.build_frame("x", body, ["q"]).split("\n")
+    c.check("a clipped body says how much is hidden",
+            any("more lines" in plain_of(line) for line in out))
+    short = fx.build_frame("x", body[:3], ["q"]).split("\n")
+    c.check("a body that fits is untouched",
+            [plain_of(line) for line in short[3:6]] == body[:3])
+
+    sized(fx, 40, 24)
+    crumb = "datamosh › second video start time in seconds"
+    head = fx.build_frame(crumb, [], ["q"], note="clip.mp4").split("\n")[0]
+    c.check("a long crumb is truncated, not wrapped",
+            vis(head) <= 38 and "…" in plain_of(head), repr(plain_of(head)))
+    c.check("the note gives way to a long crumb",
+            "clip.mp4" not in plain_of(head))
+    head = fx.build_frame("main menu", [], ["q"], note="3 in input/")
+    c.check("a short crumb keeps the note on the right",
+            plain_of(head.split("\n")[0]).rstrip().endswith("3 in input/"))
+
+    sized(fx, 60, 24)
+    wide = "  " + "日本語" * 20      # 120 cells of cjk
+    clipped = fx.clip_visible(wide, 30)
+    c.check("wide characters count two cells", fx.vlen("日本") == 4)
+    c.check("clip_visible cuts wide characters by cells",
+            fx.vlen(clipped) <= 30, str(fx.vlen(clipped)))
+    c.check("trunc cuts wide characters by cells",
+            fx.vlen(fx.trunc(wide, 21)) <= 21)
+    colored = fx.C_FROST + "abcdefghij" + fx.NC
+    c.check("clip_visible keeps the colours and resets after the cut",
+            fx.clip_visible(colored, 5).startswith(fx.C_FROST)
+            and fx.clip_visible(colored, 5).endswith(fx.NC)
+            and fx.vlen(fx.clip_visible(colored, 5)) == 5)
+    note = fx.build_frame("x", [], ["q"], notice=fx.C_AMB + "careful" + fx.NC)
+    c.check("a notice keeps its colour", fx.C_AMB + "careful" in note)
+
+
+def reversed_cells(text: str) -> list:
+    """replay the sgr codes and say, for every visible cell, whether the
+    reverse attribute is on - what the terminal would paint"""
+    state = False
+    cells = []
+    pos = 0
+    sgr = re.compile(r"\033\[([0-9;]*)m")
+    while pos < len(text):
+        m = sgr.match(text, pos)
+        if m:
+            for param in (m.group(1) or "0").split(";"):
+                if param in ("", "0", "27"):
+                    state = False
+                elif param == "7":
+                    state = True
+            pos = m.end()
+            continue
+        cells.append(state)
+        pos += 1
+    return cells
+
+
+def unit_row_highlight(c: Checker, fx) -> None:
+    fx.apply_palette(True)
+    sized(fx, 60, 24)
+    text = ("  " + fx.C_GRN + "✓" + fx.NC + " " + fx.fit("label", 14)
+            + fx.C_DIM + "a hint" + fx.NC + " tail")
+    lit = fx.row(text, True)
+    cells = reversed_cells(lit)[2:]           # the two-space gutter is plain
+    c.check("highlight spans the whole row after embedded resets",
+            cells and all(cells), f"{cells.count(False)} cells unlit")
+    c.check("highlighted and plain rows have the same width",
+            fx.vlen(lit) == fx.vlen(fx.row(text, False)) == 58)
+    c.check("the highlight is switched off after the row",
+            not reversed_cells(lit + "x")[-1])
+    long_text = fx.C_FROST + "x" * 100 + fx.NC
+    c.check("an overlong row keeps its colour when cut",
+            fx.C_FROST in fx.row(long_text, False)
+            and fx.vlen(fx.row(long_text, False)) == 58)
+    fx.apply_palette(False)
+    c.check("no colour: a highlighted row is plain text",
+            "\033" not in fx.row("  plain", True))
+
+
+def unit_lists(c: Checker, fx) -> None:
+    c.check("empty list: movement keys do not divide by zero",
+            all(fx.nav_index(k, 0, 0, 5) == 0
+                for k in ("up", "down", "home", "end", "pgup", "pgdn")))
+    c.check("nav: home/end/pgup/pgdn",
+            (fx.nav_index("home", 7, 20, 5), fx.nav_index("end", 0, 20, 5),
+             fx.nav_index("pgdn", 18, 20, 5), fx.nav_index("pgup", 3, 20, 5))
+            == (0, 19, 19, 0))
+    c.check("nav: other keys are not movement",
+            fx.nav_index("q", 0, 3, 5) is None)
+    c.check("a list that fits needs no more-line",
+            fx.list_page(4, 10) == 4)
+    c.check("an overflowing list saves a line for the more-line",
+            fx.list_page(40, 10) == 9)
+    c.check("after the terminal grows the list scrolls back up",
+            fx.scroll_top(30, 25, 30, 40) == 10)
+
+    # select() with an empty list on a tty: draw, move, enter, then back
+    import io
+    keys = iter(["down", "up", "end", "\r", " ", "1", "p", "q"])
+    drawn = []
+    real_stdin, real_read, real_draw = sys.stdin, fx.read_one_key, fx.draw
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    sys.stdin = Tty()
+    fx.read_one_key = lambda: next(keys)
+    fx.draw = drawn.append
+    try:
+        picked = fx.select("pick", [], lambda it, i, sel: "", keys=[],
+                           jump={"p": 0})
+        crashed = ""
+    except Exception as exc:     # noqa: BLE001 - the regression is a crash
+        picked, crashed = "crash", repr(exc)
+    finally:
+        sys.stdin, fx.read_one_key, fx.draw = real_stdin, real_read, real_draw
+    c.check("select() on an empty list survives every key and goes back",
+            picked is None and not crashed, crashed)
+    c.check("an empty list says so",
+            any("nothing to pick" in frame for frame in drawn))
+
+
+def unit_draw(c: Checker, fx) -> None:
+    import io
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    real = sys.stdout
+    out = Tty()
+    sys.stdout = out
+    try:
+        sized(fx, 40, 10)
+        fx.SCREEN.drawn = None
+        fx.draw("\n".join(f"line {n}" for n in range(30)))
+        first = out.getvalue()
+        out.seek(0)
+        out.truncate()
+        fx.draw("a\nb")
+        second = out.getvalue()
+        out.seek(0)
+        out.truncate()
+        sized(fx, 50, 12)
+        fx.draw("a\nb")
+        third = out.getvalue()
+    finally:
+        sys.stdout = real
+    c.check("draw clips a tall frame to rows-1 lines",
+            first.count("\n") == 9, str(first.count("\n")))
+    c.check("draw keeps the last line of a clipped frame (the footer)",
+            "line 29" in first)
+    c.check("first frame clears the screen", first.startswith("\033[2J\033[H"))
+    c.check("same size: just home the cursor", second.startswith("\033[H"))
+    c.check("every drawn line erases to its end",
+            second == "\033[Ha\033[K\nb\033[K\n\033[J", repr(second))
+    c.check("a new size clears the whole screen first",
+            third.startswith("\033[2J\033[H"))
+    fx.SCREEN.seen = (50, 12)
+    c.check("no resize reported while the size holds", not fx.SCREEN.resized())
+    sized(fx, 70, 20)
+    c.check("a size change is reported once",
+            fx.SCREEN.resized() and not fx.SCREEN.resized())
+
+
+def scenario_units(c: Checker) -> None:
+    fx = load_effex()
+    saved_size = fx.terminal_size
+    try:
+        unit_key_decoding(c, fx)
+        unit_frames(c, fx)
+        unit_row_highlight(c, fx)
+        unit_lists(c, fx)
+        unit_draw(c, fx)
+    finally:
+        fx.terminal_size = saved_size
+        fx.apply_palette(False)
+
+
 def main() -> int:
     c = Checker("layout")
+    scenario_units(c)
     if not require_tools(c):
-        return 0
+        return c.summary()
     scenario_sizes(c)
     scenario_effect_options(c, "datamosh", 3, 0, "audio")
     scenario_effect_options(c, "archaeology", 2, 5, "random seed")

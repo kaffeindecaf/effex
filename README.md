@@ -55,6 +55,7 @@ answer `y` and it uses the package manager it finds on your system. see
 | key | does |
 | --- | --- |
 | `up` `down` | move through the list |
+| `home` `end` `pgup` `pgdn` | jump to either end of a list, or a page at a time |
 | `enter` | pick the highlighted row |
 | `left` `right` | change a value in place |
 | `space` | chip an effect onto the chain (chip 1, 2, 3 = run order) |

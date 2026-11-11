@@ -37,7 +37,9 @@ import time
 
 class PtyDriver:
     def __init__(self, argv, rows=44, cols=110, env_extra=None, timeout=8,
-                 cwd=None):
+                 cwd=None, controlling=False):
+        """controlling=True makes the pty the app's controlling terminal, so
+        ctrl+c and ctrl+z written to it raise signals as in a real shell"""
         self.master, slave = pty.openpty()
         try:
             fcntl.ioctl(slave, termios.TIOCSWINSZ,
@@ -48,12 +50,30 @@ class PtyDriver:
                    LC_ALL="C.UTF-8", LANG="C.UTF-8")
         if env_extra:
             env.update(env_extra)
+
+        def take_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
         self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave,
                                      stderr=slave, env=env, cwd=cwd,
-                                     close_fds=True)
+                                     close_fds=True,
+                                     preexec_fn=take_terminal if controlling
+                                     else None)
         os.close(slave)
         self.buf = b""
         self.timeout = timeout
+
+    def resize(self, rows, cols):
+        """change the window size, as dragging the terminal edge would"""
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
+
+    def tty_modes(self):
+        """(canonical, echo) of the pty - linux shares one termios between
+        the master and the slave, so this reads what the app left behind"""
+        lflag = termios.tcgetattr(self.master)[3]
+        return bool(lflag & termios.ICANON), bool(lflag & termios.ECHO)
 
     def pump(self, seconds=0.4):
         """drain whatever the app has drawn, keeping a bounded buffer"""
