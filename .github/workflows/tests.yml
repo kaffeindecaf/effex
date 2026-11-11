@@ -24,6 +24,8 @@ jobs:
           python -m pip install -r requirements-collapse.txt -r requirements-inversion.txt ruff
       - name: check changed processor code
         run: ruff check --select F frame_pipeline.py timestamped_frames.py stateful_effects.py reverse_infection.py tests/reverse_infection_regression.py benchmarks/reverse_infection.py tests/inversion_regression.py tests/platform_support.py tests/install_prompt.py tests/logging_regression.py
+      - name: Reverse Infection CPU and timestamped renders
+        run: python tests/reverse_infection_regression.py
       - name: run every suite with optional dependencies present
         run: python tests/run_tests.py
 
@@ -47,6 +49,13 @@ jobs:
         shell: pwsh
         run: |
           python tests/platform_support.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Reverse Infection CPU and timestamped renders
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-reverse-infection.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python tests/reverse_infection_regression.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: diagnostics log
         shell: pwsh
