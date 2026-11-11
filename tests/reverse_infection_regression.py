@@ -80,6 +80,72 @@ class InfectionTests(unittest.TestCase):
         self.assertLess(areas[1], areas[2], areas)
         self.assertLessEqual(areas[2], areas[3], areas)
 
+    def test_default_corruption_preserves_full_color_texture_instead_of_a_halo(self):
+        shape = (96, 128, 3)
+        background = (18, 22, 28)
+        palette = np.array([background, (224, 32, 16), (16, 64, 224), (232, 216, 32)], np.uint8)
+        yy, xx = np.indices((48, 32))
+        texture = palette[1 + (xx // 4 + yy // 4) % 3]
+        frames = []
+        for i in range(25):
+            image = np.empty(shape, np.uint8)
+            image[:] = background
+            if i >= 12:
+                image[24:72, 48:80] = texture
+            frames.append(packet(image, i))
+        p = self.processor(shape=shape)
+        with patch.object(p, "_estimate_flow", side_effect=lambda a, b:
+                          np.zeros((*a.shape, 2), np.float32)):
+            output = list(process_packets(iter(frames), [p]))
+        allowed = {tuple(c) for c in palette.tolist()}
+        for q in output[:12]:
+            colors = {tuple(c) for c in np.unique(q.frame.reshape(-1, 3), axis=0).tolist()}
+            self.assertTrue(colors <= allowed, f"frame {q.index} introduced faded/dilated colors")
+        early = output[8].frame
+        self.assertGreater(np.count_nonzero(np.any(early != background, axis=2)), 100)
+        # Corruption moves/repeats actual texture outside the donor silhouette.
+        outside = early.copy()
+        outside[24:72, 48:80] = background
+        self.assertGreater(np.count_nonzero(np.any(outside != background, axis=2)), 50)
+
+    def test_spreading_copies_complete_prediction_tiles_with_their_texture(self):
+        p = self.processor()
+        rng = np.random.default_rng(12)
+        tile = rng.integers(0, 241, (16, 16, 3), dtype=np.uint8)
+        image = np.zeros((64, 96, 3), np.uint8)
+        image[16:32, 32:48] = tile
+        mask = np.zeros((64, 96), np.float32)
+        mask[16:32, 32:48] = 1
+        copied, grown = p._grow(image, mask, np.zeros((64, 96, 2), np.float32), depth=6)
+        for x, y in ((16, 16), (48, 16), (32, 0), (32, 32)):
+            np.testing.assert_array_equal(copied[y:y + 16, x:x + 16], tile)
+            self.assertTrue(np.all(grown[y:y + 16, x:x + 16] == 1))
+
+    def test_overlap_switches_whole_blocks_without_creating_blended_colors(self):
+        p = self.processor(lookahead_frames=4, window_overlap=2)
+        original = np.full((64, 96, 3), 20, np.uint8)
+        blue, red = original.copy(), original.copy()
+        blue[:] = (10, 30, 230)
+        red[:] = (230, 30, 10)
+        p._overlap = {i: blue.copy() for i in range(4)}
+        reconstructions = ((i, red.copy()) for i in range(3, -1, -1))
+        with patch.object(p, "_reconstruct", return_value=reconstructions):
+            output = []
+            for i in range(5):
+                output.extend(p.push(packet(original, i)))
+        colors = {tuple(c) for c in np.unique(output[0].frame.reshape(-1, 3), axis=0).tolist()}
+        self.assertEqual(colors, {(10, 30, 230), (230, 30, 10)})
+
+    def test_mutation_overdrives_and_loses_motion_vectors_by_block(self):
+        p = self.processor()
+        flow = np.empty((64, 96, 2), np.float32)
+        flow[:] = (2.4, -1.2)
+        damaged = p._mosh_flow(flow)
+        self.assertTrue(np.any(np.all(damaged == 0, axis=2)))
+        self.assertTrue(np.any(damaged[..., 0] > flow[..., 0]))
+        np.testing.assert_array_equal(damaged[:16, :16],
+                                      np.broadcast_to(damaged[0, 0], (16, 16, 2)))
+
     def test_seed_is_repeatable_resettable_and_changes_mutation(self):
         p = self.processor(seed=42)
         a = list(process_packets(scene(), [p]))

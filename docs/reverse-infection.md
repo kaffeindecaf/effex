@@ -2,8 +2,11 @@
 
 In **CODEC & BLOCKS → datamosh → algorithm**, select **Reverse Infection**.
 It propagates future visual material backward through consecutive optical-flow
-fields, with decay, spatial growth and persistent block corruption. Events can
-contaminate an empty scene before their subjects arrive.
+fields, with held/overdriven prediction vectors and repeated image tiles. Events
+can contaminate an empty scene before their subjects arrive. Infected blocks
+replace pixels at full color strength; decay reduces their coverage instead of
+fading a silhouette. Growth copies complete textured tiles, including displaced
+background detail, rather than dilating color into a cloud.
 
 The [five-second comparison](examples/reverse-infection/comparison.mp4) shows
 the source on the left and the Effex export on the right. The red figure enters
@@ -53,15 +56,15 @@ JSON; this change does not introduce a separate configuration store.
 
 | Parameter | Default | Range / meaning |
 | --- | --- | --- |
-| `intensity` | 0.75 | 0–1, final effect strength; zero bypasses immediately |
+| `intensity` | 0.75 | 0–1, corrupted block coverage; zero bypasses immediately |
 | `lookahead_frames` | 24 | 0–128 future frames in frame mode; zero bypasses |
-| `infection_strength` | 0.8 | 0–1, inserted material opacity; zero bypasses |
+| `infection_strength` | 0.8 | 0–1, coverage of full-strength prediction blocks; zero bypasses |
 | `backward_decay` | 0.95 | 0–1, mask retention at every backward step |
 | `spread_radius` | 3 | −16–16 pixels per step; negative values erode |
 | `block_size` | 16 | 1–128 pixels, fragment/displacement grid |
 | `motion_alignment` | 1.0 | 0–1, consecutive flow sampling gain |
-| `mutation_strength` | 0.25 | 0–1, displacement, seeded gaps and fragmentation |
-| `window_overlap` | 8 | 0–64 reconstructed frames blended between windows |
+| `mutation_strength` | 0.25 | 0–1, held/overdriven vectors and block displacement |
+| `window_overlap` | 8 | 0–64 reconstructed frames switched by block between windows |
 | `seed` | 42 | 0–2147483647; zero retains Effex's source-derived seed convention |
 | `lookahead_mode` | frames | `frames` or `seconds` |
 | `lookahead_seconds` | 1.0 | 0–5 seconds of original PTS in seconds mode |
@@ -90,24 +93,24 @@ CLI listing continues to work.
    `(x+F.x, y+F.y)` with `cv2.remap`. The positive sign is deliberate: remap asks
    where to sample the future for each earlier destination pixel. Tests verify
    both real translated textures and a controlled multi-step translation.
-3. Seed a mask from future-versus-window-start RGB changes, with deterministic
-   block gaps. Step backward through **every** adjacent motion field, warping
-   the already-corrupted donor image and mask together. Smooth time-dependent,
-   blockwise offsets mutate the sampling field. Dilation spreads material into
-   neighboring support; motion weights an additional growth ring. Negative
-   spread contracts support. Seeded gates preserve fragments during growth.
-4. Carry donor color through the entire recurrence. Dilation extends weighted
-   donor colors only into newly grown support; inactive pixels refresh from the
-   original. Decay acts on the mask. Each output receives one convex composite
-   with its original frame, preventing additive brightness/gray feedback.
+3. Seed prediction blocks from future-versus-window-start RGB changes, rejecting
+   isolated ringing noise. Step backward through **every** adjacent motion field.
+   Quantize and overdrive vectors by block, hold a seeded share of vectors, and
+   apply stepped displacements held for three source frames. Nearest-neighbor
+   sampling preserves damaged texture rather than smoothing repeated warps.
+4. Grow through neighboring prediction blocks on a schedule controlled by spread
+   and motion. Copy a complete tile from the strongest damaged neighbor into new
+   or weakly damaged support, including its texture and background. Repeated copies
+   carry already-corrupted visual content. Negative spread erodes block support.
+   Mask decay and strength determine which whole blocks replace original pixels;
+   there is no RGB alpha fade, additive feedback, or channel-max color dilation.
 5. A full window contains at most `lookahead+1` source frames. Emit its prefix,
    retain the original overlap plus source frame, and cache overlap RGB
-   reconstructions. The next window blends old/new reconstructions with a
-   linearly increasing weight across that overlap. This blends alternative
-   reconstructions of the **same timestamp**; source playback remains forward.
+   reconstructions. The next window switches whole blocks from old to new with
+   increasing coverage across the overlap. Each chosen pixel comes from one
+   reconstruction of the **same timestamp**, avoiding translucent window joins.
    Stable seeded spatial fields and source-time displacement avoid restarting
-   randomness at joins. This is a documented seam strategy, not an assertion
-   that rapidly changing footage cannot reveal any window structure.
+   randomness. Fast footage can still reveal some window structure.
 6. Detected RGB scene cuts or explicit `scene_cut` packets drain the previous
    scene before accepting the new one. Seeks, non-increasing PTS, index gaps or
    source changes discard stale timeline state. EOF processes only remaining
@@ -144,12 +147,12 @@ interactive playback speed; throughput varies with resolution and scene content.
 
 | Resolution / clip | Processor fps | Peak traced allocations | Peak process RSS | Max buffered frames |
 | --- | ---: | ---: | ---: | ---: |
-| 320×180 / 120 frames | 78.7 | 18.5 MiB | 62.1 MiB | 25 |
-| 320×180 / 480 frames | 75.8 | 18.5 MiB | 63.0 MiB | 25 |
-| 1280×720 / 72 frames | 4.09 | 259.0 MiB | 302.7 MiB | 25 |
-| 1920×1080 / 30 frames | 1.71 | 419.9 MiB | 461.8 MiB | 14 |
+| 320×180 / 120 frames | 89.9 | 17.6 MiB | 60.8 MiB | 25 |
+| 320×180 / 480 frames | 68.6 | 17.6 MiB | 62.2 MiB | 25 |
+| 1280×720 / 72 frames | 5.25 | 243.2 MiB | 288.0 MiB | 25 |
+| 1920×1080 / 30 frames | 1.90 | 367.0 MiB | 409.3 MiB | 14 |
 
-The 120-frame CLI example, including decoding/encoding, took **2.32 seconds**.
+The 120-frame CLI example, including decoding/encoding, took **2.00 seconds**.
 The longer small clip retained the same 8.9 MiB of processor state and had the
 same traced allocation peak. At 1080p the memory calculation reduced the horizon
 to 13 frames and overlap to 6. The 30-frame 1080p sample is the room-only prefix
@@ -159,13 +162,15 @@ of the generator; the smaller examples include the moving figure. Raw reports:
 [720p](examples/reverse-infection/measurements-720p.json),
 [1080p](examples/reverse-infection/measurements-1080p.json).
 
-The regression suite has **12 passing tests** covering early future-only color,
+The regression suite has **16 tests** covering early future-only color,
 consecutive propagation and verified flow direction/scaling, growth versus
 erosion, seeds/reset/config round trips, packet ownership, VFR metadata and
 timestamp horizons, short/empty/EOF clips, disabled identity, brightness bounds,
 scene cuts/seeks/source changes, long-stream capacity pressure, overlap joins,
 selector/menu validation, real VFR export, copied audio and preview with/without
-audio. The suite is included in the Ubuntu CI test runner.
+audio. Added visual regressions require intact textured tile copies, full-strength
+palette colors instead of halos, held/overdriven vectors and overlap joins without
+intermediate RGB colors. The suite runs on Ubuntu and Windows CI.
 
 Additional local validation: existing datamosh, self-mosh, pulse-mosh, bitstream,
 stateful, flowmosh, CLI and platform suites pass. Thirteen existing inversion

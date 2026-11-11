@@ -1290,7 +1290,7 @@ DATAMOSH_PRESETS = {
 
 
 REVERSE_INFECTION_PARAMS = (
-    Param("intensity", "intensity", "Reverse Infection: overall strength; 0 bypasses", "float", .75,
+    Param("intensity", "intensity", "Reverse Infection: corrupted block coverage; 0 bypasses", "float", .75,
           minimum=0, maximum=1, step=.05),
     Param("lookahead_frames", "future frames", "Reverse Infection: frames available ahead", "int", 24,
           minimum=0, maximum=128, step=1),
@@ -1298,7 +1298,7 @@ REVERSE_INFECTION_PARAMS = (
           choices=(("frames", "frames", "frame-based horizon"), ("seconds", "seconds", "timestamp-based horizon"))),
     Param("lookahead_seconds", "future seconds", "Reverse Infection: timestamp horizon; capacity bounded", "float", 1.,
           minimum=0, maximum=5, step=.1),
-    Param("infection_strength", "infection strength", "amount of future material inserted", "float", .8,
+    Param("infection_strength", "infection strength", "coverage of full-strength future prediction blocks", "float", .8,
           minimum=0, maximum=1, step=.05),
     Param("backward_decay", "backward decay", "mask persistence per backward step", "float", .95,
           minimum=0, maximum=1, step=.01),
@@ -1308,9 +1308,9 @@ REVERSE_INFECTION_PARAMS = (
           minimum=1, maximum=128, step=1),
     Param("motion_alignment", "motion alignment", "amount of consecutive optical-flow alignment", "float", 1.,
           minimum=0, maximum=1, step=.05),
-    Param("mutation_strength", "mutation strength", "deterministic block displacement and fragmentation", "float", .25,
+    Param("mutation_strength", "mutation strength", "held/overdriven motion vectors and repeated block displacement", "float", .25,
           minimum=0, maximum=1, step=.05),
-    Param("window_overlap", "window overlap", "reconstructed frames blended across neighboring windows", "int", 8,
+    Param("window_overlap", "window overlap", "frames switched by block across neighboring windows", "int", 8,
           minimum=0, maximum=64, step=1),
     Param("flow_scale", "flow scale", "analysis fraction; longest flow side capped at 320 pixels", "float", .5,
           minimum=.125, maximum=1, step=.125),
@@ -1405,7 +1405,7 @@ def build_datamosh(ctx: EffectContext) -> Plan:
         return Plan(vf="Reverse Infection: timestamped backward optical-flow propagation",
                     out_suffix=ctx.suffix or "_REVERSE_INFECTED", width=width, height=height,
                     notes=[f"buffers up to {horizon}; preview waits for future frames before emitting",
-                           "overlapping reconstructions blend at window joins; cuts/EOF drain within the scene",
+                           "damaged prediction blocks repeat future texture; block switches join windows without fades",
                            "preserves source PTS, dimensions and audio; 512 MiB budget can shorten lookahead",
                            "CPU NumPy/OpenCV/PyAV: requirements-reverse-infection.txt (Linux/macOS/Windows)"])
     if opts.get("algorithm") == "pulse":
@@ -4263,7 +4263,7 @@ def process(chain: Chain, clip: Clip, tools: Tools, args,
     if runner is not None:
         if args.dry_run:
             stage_lines = (["decode timestamped RGB -> consecutive Farneback flow -> "
-                            "backward infection -> overlap blend -> libx264"]
+                            "backward block corruption -> overlap block switch -> libx264"]
                            if is_reverse_infection(chain, opts) else chain.stage_lines)
             for line in stage_lines:
                 _say("  " + line)

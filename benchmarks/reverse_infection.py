@@ -49,6 +49,13 @@ def frames(count, width, height, fps):
                          color, max(1, int(5 * scale)))
             cv2.line(frame, (x - int(16 * scale), y + int(5 * scale) + swing),
                      (x + int(16 * scale), y - swing), color, max(1, int(5 * scale)))
+            # Contrasting woven detail makes reference-tile copying visible;
+            # a flat silhouette cannot reveal whether texture survives growth.
+            subject = np.all(frame == color, axis=2)
+            weave = ((xx - x) // max(2, round(4 * scale))
+                     + (yy - y) // max(2, round(4 * scale))) % 5
+            frame[subject & (weave == 0)] = (45, 100, 225)
+            frame[subject & (weave == 1)] = (230, 180, 35)
         yield FramePacket(frame, i, Fraction(i, fps), Fraction(1, fps), Fraction(1, fps))
 
 

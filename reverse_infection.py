@@ -2,8 +2,10 @@
 
 Forward Farneback flow F(t -> t+1) is a *sampling* map for bringing t+1
 into t: remap(future, x + F.x, y + F.y). It must not be negated.
-Windows share original packets and crossfade their overlapping reconstructions;
-random fields are tied to source time, so overlap never restarts the noise.
+Windows share original packets and switch overlapping reconstructions by block.
+Future pixels are a damaged prediction reference: block copies and wrong/held
+motion vectors carry texture backward. Strength controls replacement coverage,
+never translucent RGB opacity or color dilation.
 """
 from dataclasses import replace
 import math
@@ -158,80 +160,143 @@ class ReverseInfection:
         flow[..., 1] *= h / small.shape[0]
         return flow
 
-    def _warp(self, image, flow, displacement=None):
+    def _warp(self, image, flow, displacement=None, interpolation=None, border_mode=None):
         x = self._grid[0] + flow[..., 0] * self._config["motion_alignment"]
         y = self._grid[1] + flow[..., 1] * self._config["motion_alignment"]
         if displacement is not None:
             x += displacement[0]
             y += displacement[1]
-        return self._cv2.remap(image, x, y, self._cv2.INTER_LINEAR,
-                               borderMode=self._cv2.BORDER_CONSTANT)
+        return self._cv2.remap(image, x, y,
+                               self._cv2.INTER_LINEAR if interpolation is None else interpolation,
+                               borderMode=self._cv2.BORDER_CONSTANT if border_mode is None else border_mode)
+
+    def _expand_blocks(self, cells):
+        """Expand exact block_size tiles, cropping only the last edge tiles."""
+        b = self._config["block_size"]
+        return cells.repeat(b, axis=0).repeat(b, axis=1)[:self._shape[0], :self._shape[1]]
+
+    def _pool_blocks(self, field, maximum=False):
+        np = self._np
+        b = self._config["block_size"]
+        gx, gy = self._blocks
+        h, w = field.shape[:2]
+        padded = np.pad(field, ((0, gy * b - h), (0, gx * b - w)), mode="edge")
+        tiles = padded.reshape(gy, b, gx, b)
+        return tiles.max(axis=(1, 3)) if maximum else tiles.mean(axis=(1, 3))
+
+    def _mosh_flow(self, flow):
+        """Lose/hold and overdrive prediction vectors at macroblock boundaries."""
+        mutation = self._config["mutation_strength"]
+        if mutation == 0:
+            return flow
+        np = self._np
+        blocks = []
+        for component in range(2):
+            vectors = self._pool_blocks(flow[..., component]) * (1 + mutation * 3)
+            vectors = np.rint(vectors / 2) * 2
+            vectors[self._noise[2] > 1 - mutation * 2] = 0
+            blocks.append(self._expand_blocks(vectors))
+        return np.stack(blocks, axis=2).astype(np.float32)
 
     def _displacement(self, timestamp):
-        np, cv2 = self._np, self._cv2
-        h, w, _ = self._shape
-        amount = self._config["mutation_strength"] * self._config["block_size"]
-        phase = float(timestamp) * 1.7
-        return tuple(cv2.resize(field * np.float32(amount * math.sin(phase + offset)),
-                                (w, h), interpolation=cv2.INTER_NEAREST)
-                     for field, offset in zip(self._noise[:2], (.5, 2.1)))
+        np = self._np
+        amount = self._config["mutation_strength"] * self._config["block_size"] * 1.5
+        # Hold damage for three source frames, then flip the error. This gives
+        # sticking/tearing reference blocks without an unbounded random drift.
+        sign = 1 if int(float(timestamp) * self._fps // 3) % 2 else -1
+        return tuple(self._expand_blocks((np.rint(field * amount / 2) * (2 * sign)).astype(np.float32))
+                     for field in self._noise[:2])
 
-    def _grow(self, image, mask, flow):
+    def _grow(self, image, mask, flow, depth, original=None):
         np, cv2 = self._np, self._cv2
         radius = self._config["spread_radius"]
         if radius == 0:
             return image, mask
-        k = abs(radius) * 2 + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        cells = self._pool_blocks(mask, maximum=True)
         if radius < 0:
-            return image, cv2.erode(mask, kernel)
-        expanded = cv2.dilate(mask, kernel)
-        # Moving regions receive a second, smoothly weighted ring of growth.
-        speed = np.minimum(np.linalg.norm(flow, axis=2) / self._config["block_size"], 1)
-        expanded += (cv2.dilate(expanded, kernel) - expanded) * speed * .5
-        # Extend the carried material into the new mask support. No additive
-        # feedback: existing pixels keep their color; only new support is filled.
-        support = cv2.dilate(mask, kernel)
-        donor = cv2.dilate(image * mask[..., None], kernel)
-        donor /= np.maximum(support[..., None], 1e-6)
-        grown = expanded > mask + 1e-5
-        image[grown] = donor[grown]
-        return image, expanded
+            interval = max(1, math.ceil(self._config["block_size"] / abs(radius)))
+            if depth % interval == 0:
+                cells = cv2.erode(cells, np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT,
+                                  borderValue=0)
+            return image, self._expand_blocks(cells)
+        # Grow in whole prediction blocks. New support inherits an actual tile
+        # of the damaged reference, including texture/background, not max RGB
+        # channel values expanded into a solid colored cloud.
+        b = self._config["block_size"]
+        speed = self._pool_blocks(np.linalg.norm(flow, axis=2))
+        rate = (radius + np.minimum(speed, b) * .25) / b
+        ticks = np.floor(depth * rate) - np.floor((depth - 1) * rate)
+        gx, gy = self._blocks
+        yy, xx = np.indices((gy, gx), dtype=np.int32)
+        for iteration in range(max(1, math.ceil(float(rate.max())))):
+            difference = (cv2.absdiff(image, original).max(axis=2) if original is not None
+                          else image.max(axis=2))
+            energy = self._pool_blocks(difference.astype(np.float32)) / 255
+            vacant = (cells < 1e-5) | (energy < .02)
+            eligible = vacant & (ticks > iteration)
+            if not np.any(eligible):
+                continue
+            padded = np.pad(cells, 1)
+            padded_energy = np.pad(energy, 1)
+            best = np.full_like(cells, -1)
+            donors_x, donors_y = xx.copy(), yy.copy()
+            grown = cells.copy()
+            for direction, (dx, dy) in enumerate(((1, 0), (-1, 0), (0, 1), (0, -1))):
+                candidate = padded[1 - dy:gy + 1 - dy, 1 - dx:gx + 1 - dx]
+                detail = padded_energy[1 - dy:gy + 1 - dy, 1 - dx:gx + 1 - dx]
+                priority = (self._noise[0] + direction * .37) % 1
+                score = candidate * .2 + detail * 4 + priority * .01
+                take = eligible & (candidate > 1e-5) & (detail > energy) & (score > best)
+                donors_x[take], donors_y[take] = xx[take] - dx, yy[take] - dy
+                grown[take], best[take] = candidate[take], score[take]
+            added = (donors_x != xx) | (donors_y != yy)
+            if np.any(added):
+                x = self._grid[0] + self._expand_blocks((donors_x - xx).astype(np.float32) * b)
+                y = self._grid[1] + self._expand_blocks((donors_y - yy).astype(np.float32) * b)
+                copied = cv2.remap(image, x, y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT_101)
+                added_pixels = self._expand_blocks(added)
+                image[added_pixels] = copied[added_pixels]
+            cells = grown
+        return image, self._expand_blocks(cells)
+
+    def _replace_blocks(self, original, donor, coverage):
+        # Fixed per-block thresholds make decay remove fragments spatially,
+        # instead of fading the entire infection into a translucent silhouette.
+        gy, gx = self._noise[2].shape
+        yy, xx = self._np.indices((gy, gx))
+        # An ordered 2x2 rank guarantees small subjects retain fragments; pure
+        # random thresholds could reject every block occupied by a small object.
+        bayer = self._np.array([[0, 2], [3, 1]], dtype=self._np.float32)
+        threshold = bayer[(yy + self._seed // 2) % 2, (xx + self._seed) % 2] * .125
+        threshold += (self._noise[2] + 1) * .0125
+        selected = self._expand_blocks(coverage > threshold)
+        result = original.copy()
+        result[selected] = donor[selected]
+        return result
 
     def _reconstruct(self, end):
         """Yield (position, reconstruction) backward, carrying mutated pixels."""
         np, cv2 = self._np, self._cv2
         future = self._queue[end]["packet"].frame
         first = self._queue[0]["packet"].frame
-        image = future.astype(np.float32)
-        # Seed changed future material, rather than a full-frame ghost overlay.
-        delta = np.max(np.abs(image - first.astype(np.float32)), axis=2)
-        mask = np.clip((delta - 12) / 48, 0, 1).astype(np.float32)
-        h, w, _ = self._shape
-        fragments = cv2.resize(self._noise[2], (w, h), interpolation=cv2.INTER_NEAREST)
-        mask *= np.clip(.8 + fragments * self._config["mutation_strength"], 0, 1)
-        # Keep seeded holes through the recurrence, otherwise dilation quickly
-        # fills every fragment and the result becomes one smooth temporal ghost.
-        gate = (fragments >= -1 + self._config["mutation_strength"] * 1.2).astype(np.float32)
-        if self._config["mutation_strength"] < .5:
-            gate = cv2.GaussianBlur(gate, (3, 3), .6)
+        image = future.copy()
+        delta = cv2.absdiff(future, first).max(axis=2)
+        # Ignore isolated codec/ringing noise in an otherwise unchanged tile.
+        seeds = (self._pool_blocks((delta > 24).astype(np.float32)) > .04).astype(np.float32)
+        mask = self._expand_blocks(seeds)
         for pos in range(end - 1, -1, -1):
             entry = self._queue[pos]
-            flow = self._full_flow(entry["flow"])
+            flow = self._mosh_flow(self._full_flow(entry["flow"]))
             displacement = self._displacement(entry["packet"].timestamp)
-            image = self._warp(image, flow, displacement)
-            mask = self._warp(mask, flow, displacement)
-            image, mask = self._grow(image, mask, flow)
-            mask *= self._config["backward_decay"]
-            mask *= gate
-            np.clip(mask, 0, 1, out=mask)
-            # Refresh only inactive donor pixels. Already-corrupted material is
-            # carried through every earlier remap, without repeatedly fading RGB.
+            image = self._warp(image, flow, displacement, cv2.INTER_NEAREST, cv2.BORDER_REFLECT_101)
+            mask = self._warp(mask, flow, displacement, cv2.INTER_NEAREST)
             original = entry["packet"].frame
+            image, mask = self._grow(image, mask, flow, end - pos, original)
+            mask *= self._config["backward_decay"]
             image[mask < 1e-5] = original[mask < 1e-5]
-            alpha = (mask * self._config["intensity"]
-                     * self._config["infection_strength"])[..., None]
-            result = np.clip(original * (1 - alpha) + image * alpha, 0, 255).astype(np.uint8)
+            coverage = (self._pool_blocks(mask, maximum=True)
+                        * self._config["intensity"] * self._config["infection_strength"])
+            result = self._replace_blocks(original, image, coverage)
             yield pos, result
 
     def _window(self, end, final=False):
@@ -252,7 +317,11 @@ class ReverseInfection:
             old = self._overlap.get(packet.index)
             if old is not None:
                 weight = (pos + 1) / (len(self._overlap) + 1)
-                result = self._cv2.addWeighted(old, 1 - weight, result, weight, 0)
+                threshold = (self._noise[0] + 1) * .5
+                take_new = self._expand_blocks(threshold < weight)
+                joined = old.copy()
+                joined[take_new] = result[take_new]
+                result = joined
             if pos < hop:
                 outputs[pos] = result
             else:
