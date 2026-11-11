@@ -102,6 +102,7 @@ frame size and audio unless its own section says otherwise.
 | [`archaeology`](#pixel-archaeology) | borrow a cutout from the future, then melt it away | yes |
 | [`rasterslip`](#raster-slip) | travelling scan bands tear sideways through different past moments | yes |
 | [`datamosh`](#heavy-datamosh) | codec-level melt - the decoder smears the motion | own pipeline |
+| [`blockmelt`](#block-melt) | macroblocks drag the stale picture along the motion | yes |
 | [`blockswap`](#blockswap) | blocks trade places, teleport on a timer, optional mosh | own pipeline |
 | `crunch` | turn the bitrate and resolution down | yes |
 
@@ -872,6 +873,46 @@ Use one input, with `audio=auto` / `first` to keep its soundtrack or `none` to
 remove it. Outputs use `_PULSE_MOSHED`. Temporary streams are removed on success,
 failure or cancellation; compressed-stream surgery still scales with clip size.
 
+#### block melt
+
+`blockmelt` sits under **CODEC & BLOCKS**, right after `datamosh`. It fakes what
+an MPEG decoder does when the residual is missing, but in pixels instead of in
+the bitstream: every frame is cut into macroblocks, each block finds its motion
+by block-matching the source against the previous source frame, and then the
+block is copied from the previous *output* along that vector. The old picture
+gets shoved around block by block - faces balloon, edges tear along the block
+grid, and new content only appears where blocks leak back in.
+
+```sh
+./effex.py blockmelt input/clip.mp4
+./effex.py blockmelt input/clip.mp4 --set block=32 --set repeat=3 --set leak=0
+./effex.py blockmelt input/clip.mp4 --set keyframe=90 --set residual=10 --set intra=60
+./effex.py blockmelt+crt input/clip.mp4 --set blockmelt.seed=17
+```
+
+| option | range | default | meaning |
+| --- | --- | --- | --- |
+| `block` | `8`, `16`, `32` | 16 | macroblock size in pixels |
+| `search` | 4-32 px | 16 | how far each block looks for its motion |
+| `residual` | 0-100% | 4 | share of the real frame difference added back; 0 is pure smear |
+| `keyframe` | 0-600 frames | 0 | clean reset interval; 0 never recovers |
+| `repeat` | 1-8 | 1 | motion bloom: re-apply each frame's vectors N times so motion accelerates |
+| `leak` | 0-100% | 1 | chance per block per frame to refresh from the real picture |
+| `intra` | 0-100% | 30 | how readily blocks with no good match are redrawn fresh, like an encoder's intra blocks; 0 never |
+| `grit` | 0-100% | 40 | how blocky and posterized leaked/intra blocks come back |
+| `seed` | 0-2147483647 | 0 | 0 derives a repeatable leak pattern from the clip |
+
+Unlike `datamosh` this never touches a codec stream, so it chains like any
+other stateful effect (`blockmelt+crt`, `neon+blockmelt+deepfry`) and keeps
+the frame size, frame count and source audio. Motion is searched on a
+downscaled luma plane, kept coherent by encoder-style biases toward zero and
+neighbouring vectors, then refined to single pixels; the first frame is always
+clean and scene cuts are moshed straight through, so a new shot drags the old
+one. A clip that fades in from black stays dark until blocks leak or intra
+refresh - raise `intra`/`leak` or set a `keyframe` interval for those. Memory
+is two frames; a 720p clip renders at roughly 15-25 fps with 16 px blocks
+(`block=8` is about half as fast). NumPy is required; there is no preview.
+
 #### blockswap
 
 `blockswap` under **CODEC & BLOCKS** swaps rectangular regions of the frame
@@ -922,7 +963,7 @@ single-pass effects stack with `+`, and order matters: `stretch+deepfry` is not
 
 `datamosh`, `timescratch` and `blockswap` edit the codec stream, so they run
 their own multi-pass pipeline and cannot be chained. stateful processors
-(`sediment`, `collapse`, `inversion`, `archaeology`, `rasterslip`) can sit before or after
+(`sediment`, `collapse`, `inversion`, `archaeology`, `rasterslip`, `blockmelt`) can sit before or after
 ordinary filters, but several of them must stay adjacent. stateful previews are
 not available.
 
@@ -993,7 +1034,7 @@ the command for the platform it detected.
 | `ffmpeg` | renders every effect | the package manager below |
 | `ffprobe` | clip details, two-video datamosh, stateful effects | ships in the ffmpeg package |
 | python 3.8+ | runs effex | [python.org](https://www.python.org/downloads/) |
-| `numpy` (optional) | sediment, collapse, inversion, archaeology, raster slip | `requirements-stateful.txt` |
+| `numpy` (optional) | sediment, collapse, inversion, archaeology, raster slip, block melt | `requirements-stateful.txt` |
 | `opencv` (optional) | elastic collapse seam detail | `requirements-collapse.txt` |
 | `PyAV` (optional) | inversion timestamps | `requirements-inversion.txt` |
 
@@ -1104,6 +1145,7 @@ your paths and file names.
 | `effex.py` | effect registry, cli, menu, ffmpeg planning, encoding, progress |
 | `stateful_effects.py` | cpu frame processors: sediment, collapse, inversion |
 | `raster_slip.py` | bounded past-frame raster bands, sideways tears and RGB offsets |
+| `block_melt.py` | pixel-domain macroblock datamosh: block matching, residual-free motion compensation |
 | `future_cut.py` | pixel archaeology, a buffered look-ahead stage |
 | `datamosh_stream.py` | codec stream surgery: vop parsing and reuse |
 | `diagnostics.py` | the log file, rotation and the issue report |
@@ -1120,6 +1162,7 @@ python3 tests/run_tests.py psychedelic  # pixel behavior, options and real rende
 python3 tests/run_tests.py datamosh mosh-stream self-mosh  # joins, algorithms and codec clocks
 python3 tests/run_tests.py pulse-mosh  # timed bursts, clean recovery, audio and fractional rates
 python3 tests/run_tests.py raster-slip  # past-band provenance, wrapping, resets, memory and real renders
+python3 tests/run_tests.py blockmelt  # blockwise motion compensation, keyframes, leak, seeds and real renders
 python3 tests/run_tests.py windows-install  # isolated Windows installer scenarios; no downloads
 python3 tests/run_tests.py collapse seams  # deformation, carving and shared pipeline
 python3 tests/run_tests.py inversion  # future pixels, original PTS and EOF fallback

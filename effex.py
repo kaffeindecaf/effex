@@ -39,6 +39,7 @@ from typing import Callable, Optional, cast
 from stateful_effects import CausalityInversion, ElasticCollapse, TemporalSediment
 from future_cut import FutureCut
 from raster_slip import RasterSlip
+from block_melt import BlockMelt
 from diagnostics import ISSUES_URL, LOG, log_dir
 
 VERSION = "0.16.0"
@@ -351,7 +352,7 @@ def prepare_console() -> None:
 # ---------------------------------------------------------------------------
 
 OPTIONAL_MODULES = [
-    ("numpy", "sediment, collapse, inversion, archaeology, raster slip", "requirements-stateful.txt"),
+    ("numpy", "sediment, collapse, inversion, archaeology, raster slip, block melt", "requirements-stateful.txt"),
     ("cv2", "collapse seam detail", "requirements-collapse.txt"),
     ("av", "inversion timestamps", "requirements-inversion.txt"),
 ]
@@ -2838,6 +2839,46 @@ def build_raster_slip(ctx: EffectContext) -> Plan:
                        "NumPy required; bounded 128 MiB / 64-frame history, clean reset at scene cuts"])
 
 
+BLOCK_MELT_PARAMS = (
+    Param("block", "macroblock size", "pixel size of the blocks that get dragged around",
+          "choice", "16", choices=(
+              ("8", "8 px", "fine blocks, slower motion search"),
+              ("16", "16 px", "classic MPEG macroblocks"),
+              ("32", "32 px", "fat, chunky blocks"),
+          )),
+    Param("search", "search range", "how far, in pixels, each block looks for its motion",
+          "int", 16, minimum=4, maximum=32, step=4),
+    Param("residual", "residual", "share of the real frame difference added back; 0 is pure smear",
+          "percent", 4, minimum=0, maximum=100, step=1),
+    Param("keyframe", "keyframe interval", "frames between clean resets; 0 never recovers",
+          "int", 0, minimum=0, maximum=600, step=10),
+    Param("repeat", "motion bloom", "times each frame's vectors are re-applied; motion accelerates",
+          "int", 1, minimum=1, maximum=8, step=1),
+    Param("leak", "leak", "chance per block per frame to refresh from the real picture",
+          "percent", 1, minimum=0, maximum=100, step=1),
+    Param("intra", "intra refresh", "how readily blocks with no good match are redrawn fresh; 0 never",
+          "percent", 30, minimum=0, maximum=100, step=5),
+    Param("grit", "grit", "how blocky and posterized leaked blocks come back",
+          "percent", 40, minimum=0, maximum=100, step=5),
+    Param("seed", "random seed", "0 derives a repeatable leak pattern from the source",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_blockmelt(ctx: EffectContext) -> Plan:
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    keyframe = int(ctx.opts.get("keyframe", 0) or 0)
+    return Plan(vf="stateful block melt frame pass", out_suffix=ctx.suffix or "_BLOCKMELTED",
+                width=width, height=height,
+                notes=["block-matches source motion, then drags the stale canvas along it",
+                       f"{ctx.opts.get('block', '16')} px blocks, "
+                       f"{ctx.opts.get('residual', 4)}% residual, "
+                       f"bloom x{ctx.opts.get('repeat', 1)}, {ctx.opts.get('leak', 1)}% leak",
+                       f"clean keyframe every {keyframe} frames" if keyframe
+                       else "no keyframes: only leaked blocks recover",
+                       "NumPy required; bounded canvas, scene cuts are moshed through"])
+
+
 EFFECTS = [
     Effect(key="stretch", name="stretch",
            blurb="squash the frame into another shape",
@@ -2996,6 +3037,14 @@ EFFECTS = [
            stages=("decode RGB frames through earlier FFmpeg filters",
                    "delay individual raster bands, slip them sideways, misalign RGB edges",
                    "encode with later filters and original audio")),
+    Effect(key="blockmelt", name="block melt",
+           blurb="macroblocks drag the stale picture along the motion",
+           tag="block-matched motion vectors, residual dropped",
+           build=build_blockmelt, params=BLOCK_MELT_PARAMS,
+           frame_processor=BlockMelt,
+           stages=("decode RGB frames through earlier FFmpeg filters",
+                   "block-match source motion, copy stale canvas blocks along the vectors",
+                   "encode with later filters and original audio")),
 ]
 
 EFFECT_BY_KEY = {e.key: e for e in EFFECTS}
@@ -3012,7 +3061,7 @@ EFFECT_GROUPS = (
         "trails", "timescratch", "sediment", "dropout", "inversion", "archaeology", "rasterslip",
     )),
     ("CODEC & BLOCKS", (
-        "datamosh", "blockswap", "crunch",
+        "datamosh", "blockmelt", "blockswap", "crunch",
     )),
 )
 _grouped_effect_keys = tuple(key for _title, keys in EFFECT_GROUPS
