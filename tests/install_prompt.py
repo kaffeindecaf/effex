@@ -144,8 +144,12 @@ def main() -> int:
     c.check("requirements screen offers the install",
             d.wait_for("install ffprobe now?"))
     d.send(b"n")
+    c.check("a declined install pauses so the hint stays readable",
+            d.wait_for("press any key"), d.text()[-400:])
+    d.send(b" ")
     c.check("requirements screen marks ffprobe missing",
-            d.wait_for("not on PATH"), d.text()[-400:])
+            d.wait_for("enter back") and d.wait_for("not on PATH"),
+            d.text()[-400:])
     d.send(ENTER)
     d.send(b"q")
     rc = d.expect_exit(6)

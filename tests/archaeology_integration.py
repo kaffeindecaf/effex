@@ -29,6 +29,7 @@ class ArchaeologyIntegration(unittest.TestCase):
         data = json.loads(listed.stdout)
         self.assertIn("archaeology", [e["key"] for e in data["effects"]])
 
+    @unittest.skipUnless(importlib.util.find_spec("av"), "install requirements-inversion.txt")
     def test_cli_renders_future_cutouts_and_preserves_audio(self):
         with tempfile.TemporaryDirectory(prefix="effex-archaeology-cli-") as directory:
             root = Path(directory)
@@ -83,6 +84,7 @@ class ArchaeologyIntegration(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2, setting)
                 self.assertNotIn(b"Traceback", proc.stderr)
 
+    @unittest.skipUnless(importlib.util.find_spec("av"), "install requirements-inversion.txt")
     def test_filter_and_timestamped_chains(self):
         with tempfile.TemporaryDirectory(prefix="effex-archaeology-chains-") as directory:
             root = Path(directory)

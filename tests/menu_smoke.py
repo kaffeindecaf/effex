@@ -903,7 +903,7 @@ def scenario_blockswap(c: Checker):
         d.send(ENTER)
         d.wait_for("pick an effect")
         next_effect_group(d, 3)                 # codec & blocks group
-        d.send(DOWN * 1)                        # blockswap, after datamosh
+        d.send(DOWN * 2)                        # blockswap, after datamosh and blockmelt
         d.send(ENTER)
         c.check("blockswap options open", wait_last(d, "blockswap options"))
         c.check("blockswap exposes teleport and mosh controls", all(
