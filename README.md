@@ -103,6 +103,7 @@ frame size and audio unless its own section says otherwise.
 | [`rasterslip`](#raster-slip) | travelling scan bands tear sideways through different past moments | yes |
 | [`datamosh`](#heavy-datamosh) | codec-level melt - the decoder smears the motion | own pipeline |
 | [`blockswap`](#blockswap) | blocks trade places, teleport on a timer, optional mosh | own pipeline |
+| [`flowmosh`](#flow-mosh) | optical flow drags stale pixels - a pixel-domain datamosh | yes |
 | `crunch` | turn the bitrate and resolution down | yes |
 
 ### shape and motion
@@ -909,6 +910,46 @@ prediction breaks, so the blocks themselves smear - which is the point. Higher
 blockswap cannot be chained with other effects and has no preview; with
 `mosh=0` it is still encoded in a single pass (same filters, normal libx264).
 
+#### flow mosh
+
+`flowmosh` under **CODEC & BLOCKS** is a datamosh done in pixels instead of in
+the bitstream. It keeps a canvas - the moshed picture - and every frame measures
+dense optical flow between the previous and current *source* frames, then drags
+the canvas along that motion. Old pixels move with new motion, which is exactly
+what P-frames do when their I-frame is gone, but because nothing touches the
+codec it chains like any other stateful effect.
+
+```sh
+./effex.py flowmosh input/clip.mp4
+./effex.py flowmosh input/clip.mp4 --set amplify=2.5 --set keyframe=0 --set bleed=0
+./effex.py flowmosh input/clip.mp4 --set blocks=0 --set detail=high
+./effex.py flowmosh+deepfry input/clip.mp4 --set flowmosh.refresh=scene
+```
+
+| option | range | default | meaning |
+| --- | --- | --- | --- |
+| `amplify` | 0-6 | 1.25 | flow multiplier; above 1 overshoots so motion smears harder, 0 freezes the canvas |
+| `keyframe` | 0-600 frames | 75 | frames between canvas refreshes (seeded +-25% jitter); 0 never refreshes after the first frame |
+| `bleed` | 0-100% | 2% | share of the real frame mixed back in each frame; 100 is a passthrough |
+| `blocks` | 0-64 px | 12 | macroblock size: one whole-pixel motion vector per block; 0 is a smooth, liquid warp |
+| `still` | 0-100% | 0 | how fast areas with no motion snap back to the live frame |
+| `refresh` | `never`, `scene` | never | `scene` restarts the canvas at a detected cut; `never` lets the old shot ride the new shot's motion |
+| `detail` | `low`, `medium`, `high` | medium | flow analysis size (160, 320 or 480 px on the long side) |
+| `seed` | 0-2147483647 | 0 | keyframe jitter; 0 derives a repeatable seed from the clip |
+
+Flow is OpenCV Farneback on a downscaled gray copy, measured backwards (current
+to previous) so every output pixel knows where to fetch from, then upscaled and
+scaled to frame pixels. In block mode each block's vector is rounded to whole
+pixels and the fraction is carried to the next frame, so blocks copy crisply
+instead of blurring through repeated resampling while slow motion still drifts.
+Flow across a detected cut is ignored, so with `refresh=never` the old picture
+holds and then starts moving with the new scene - the classic mosh transition.
+
+State is one float canvas, two remap grids and a small gray frame (about 42 MB
+at 1080p, capped at 128 MiB). The first frame is clean, and rewinds, frame-index
+jumps and new sources start over. Needs NumPy and headless OpenCV
+(`requirements-collapse.txt`); there is no stateful preview.
+
 ## chains
 
 single-pass effects stack with `+`, and order matters: `stretch+deepfry` is not
@@ -922,7 +963,7 @@ single-pass effects stack with `+`, and order matters: `stretch+deepfry` is not
 
 `datamosh`, `timescratch` and `blockswap` edit the codec stream, so they run
 their own multi-pass pipeline and cannot be chained. stateful processors
-(`sediment`, `collapse`, `inversion`, `archaeology`, `rasterslip`) can sit before or after
+(`sediment`, `collapse`, `inversion`, `archaeology`, `rasterslip`, `flowmosh`) can sit before or after
 ordinary filters, but several of them must stay adjacent. stateful previews are
 not available.
 
@@ -1104,6 +1145,7 @@ your paths and file names.
 | `effex.py` | effect registry, cli, menu, ffmpeg planning, encoding, progress |
 | `stateful_effects.py` | cpu frame processors: sediment, collapse, inversion |
 | `raster_slip.py` | bounded past-frame raster bands, sideways tears and RGB offsets |
+| `flow_mosh.py` | optical-flow datamosh: a canvas warped by the source's motion |
 | `future_cut.py` | pixel archaeology, a buffered look-ahead stage |
 | `datamosh_stream.py` | codec stream surgery: vop parsing and reuse |
 | `diagnostics.py` | the log file, rotation and the issue report |

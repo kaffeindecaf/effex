@@ -32,6 +32,7 @@ SUITES = {
     "logging": HERE / "logging_regression.py",
     "stateful": HERE / "stateful_regression.py",
     "raster-slip": HERE / "raster_slip_regression.py",
+    "flowmosh": HERE / "flowmosh_regression.py",
     "psychedelic": HERE / "psychedelic_regression.py",
     "collapse": HERE / "collapse_regression.py",
     "seams": HERE / "seam_carving_regression.py",

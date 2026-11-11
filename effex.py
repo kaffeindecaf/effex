@@ -39,6 +39,7 @@ from typing import Callable, Optional, cast
 from stateful_effects import CausalityInversion, ElasticCollapse, TemporalSediment
 from future_cut import FutureCut
 from raster_slip import RasterSlip
+from flow_mosh import FlowMosh
 from diagnostics import ISSUES_URL, LOG, log_dir
 
 VERSION = "0.16.0"
@@ -352,7 +353,7 @@ def prepare_console() -> None:
 
 OPTIONAL_MODULES = [
     ("numpy", "sediment, collapse, inversion, archaeology, raster slip", "requirements-stateful.txt"),
-    ("cv2", "collapse seam detail", "requirements-collapse.txt"),
+    ("cv2", "collapse seam detail, flowmosh", "requirements-collapse.txt"),
     ("av", "inversion timestamps", "requirements-inversion.txt"),
 ]
 
@@ -2672,6 +2673,45 @@ def build_collapse(ctx: EffectContext) -> Plan:
     )
 
 
+FLOWMOSH_PARAMS = (
+    Param("amplify", "amplify", "flow multiplier; higher smears motion harder",
+          "float", 1.25, minimum=0, maximum=6, step=0.25),
+    Param("keyframe", "keyframe every", "frames between canvas refreshes; 0 never refreshes",
+          "int", 75, minimum=0, maximum=600, step=5),
+    Param("bleed", "bleed", "share of the real frame mixed back in each frame",
+          "percent", 2, minimum=0, maximum=100, step=1),
+    Param("blocks", "macroblock size", "pixels per motion vector block; 0 smooth flow",
+          "int", 12, minimum=0, maximum=64, step=2),
+    Param("still", "still refresh", "how fast motionless areas snap back to the live frame",
+          "percent", 0, minimum=0, maximum=100, step=5),
+    Param("refresh", "scene refresh", "what a detected scene cut does to the canvas",
+          "choice", "never", choices=(
+              ("never", "never", "the old picture moves with the new scene's motion"),
+              ("scene", "scene cut", "a cut restarts the canvas from the real frame"),
+          )),
+    Param("detail", "flow detail", "optical flow analysis resolution", "choice",
+          "medium", choices=(
+              ("low", "low", "160px analysis, fastest, broad motion"),
+              ("medium", "medium", "320px analysis"),
+              ("high", "high", "480px analysis, finer motion, slower"),
+          )),
+    Param("seed", "random seed", "0 derives repeatable keyframe jitter from the clip",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_flowmosh(ctx: EffectContext) -> Plan:
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    key = int(ctx.opts.get("keyframe", 75) or 0)
+    return Plan(vf="stateful flow mosh frame pass", out_suffix=ctx.suffix or "_FLOWMOSHED",
+                width=width, height=height,
+                notes=["dense source optical flow drags a persistent canvas of stale pixels",
+                       f"x{float(ctx.opts.get('amplify', 1.25)):g} flow, "
+                       f"{ctx.opts.get('bleed', 2)}% bleed, "
+                       + (f"keyframe every ~{key} frames" if key else "no keyframes after the first"),
+                       "NumPy and OpenCV required (requirements-collapse.txt); no stateful preview"])
+
+
 ARCHAEOLOGY_PARAMS = (
     Param("lookahead", "look-ahead secs",
           "how far the buffer sees ahead; also the output delay",
@@ -2930,6 +2970,15 @@ EFFECTS = [
                "motion bloom over the whole clip",
                "pass 2: remux the mosh stream with the source audio",
            )),
+    Effect(key="flowmosh", name="flow mosh",
+           blurb="optical flow drags stale pixels - a pixel-domain datamosh",
+           tag="Farneback flow, macroblock remap of a persistent canvas",
+           build=build_flowmosh, params=FLOWMOSH_PARAMS,
+           frame_processor=FlowMosh,
+           stages=("decode RGB frames through earlier FFmpeg filters",
+                   "measure source optical flow, warp the moshed canvas along it, "
+                   "bleed the live frame back in",
+                   "encode with later filters and source audio")),
     Effect(key="dropout", name="dropout",
            blurb="frames vanish at random - the picture holds",
            tag="select=gt(random(0),C)",
@@ -3012,7 +3061,7 @@ EFFECT_GROUPS = (
         "trails", "timescratch", "sediment", "dropout", "inversion", "archaeology", "rasterslip",
     )),
     ("CODEC & BLOCKS", (
-        "datamosh", "blockswap", "crunch",
+        "datamosh", "blockswap", "flowmosh", "crunch",
     )),
 )
 _grouped_effect_keys = tuple(key for _title, keys in EFFECT_GROUPS
