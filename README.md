@@ -104,6 +104,7 @@ frame size and audio unless its own section says otherwise.
 | [`datamosh`](#heavy-datamosh) | codec-level melt - the decoder smears the motion | own pipeline |
 | [`blockswap`](#blockswap) | blocks trade places, teleport on a timer, optional mosh | own pipeline |
 | [`flowmosh`](#flow-mosh) | optical flow drags stale pixels - a pixel-domain datamosh | yes |
+| [`bitrot`](#bitrot) | corrupt the codec bitstream - broken macroblocks drift | own pipeline |
 | `crunch` | turn the bitrate and resolution down | yes |
 
 ### shape and motion
@@ -950,6 +951,44 @@ at 1080p, capped at 128 MiB). The first frame is clean, and rewinds, frame-index
 jumps and new sources start over. Needs NumPy and headless OpenCV
 (`requirements-collapse.txt`); there is no stateful preview.
 
+#### bitrot
+
+`bitrot` under **CODEC & BLOCKS** damages the compressed video itself. The clip
+is encoded to a raw MPEG-4 Part 2 stream, then seeded bit flips, zero runs and
+byte smears are written into the coded macroblock data of chosen frames. Start
+codes, the VOS/VOL headers and every VOP header (frame type, clock, quantiser)
+are left intact and no edit may form a new `00 00 01` start code, so the decoder
+keeps every frame but loses its place inside the damaged ones: green and black
+macroblock garbage, torn slices and smeared color blocks that drift through the
+following motion frames until the next keyframe repairs the picture.
+
+```sh
+./effex.py bitrot input/clip.mp4
+./effex.py bitrot input/clip.mp4 --set rate=30 --set burst=60
+./effex.py bitrot input/clip.mp4 --set target=i --set hold=120 --set mode=zero
+./effex.py bitrot input/clip.mp4 --set conceal=guess --set mode=smear --set seed=17
+```
+
+| option | range | default | meaning |
+| --- | --- | --- | --- |
+| `rate` | 0-100% | 15% | chance each targeted frame is damaged; 0 is a clean round trip |
+| `hits` | 1-16 | 2 | corruptions written into each damaged frame |
+| `mode` | `mix`, `flip`, `zero`, `smear` | `mix` | bit flips, zeroed byte runs, or runs pasted from elsewhere in the frame |
+| `target` | `p`, `i`, `all` | `p` | motion frames, keyframes (bigger, longer damage) or any frame |
+| `burst` | 0-100% | 30% | chance a hit keeps rotting the next 2-6 targeted frames |
+| `hold` | 2-600 | 48 | keyframe interval - how long damage persists |
+| `grit` | 1-31 | 8 | crunch of the intermediate mpeg4 encode; higher is blockier |
+| `conceal` | `off`, `guess` | `off` | `off` shows raw broken macroblocks, `guess` lets the decoder smooth them |
+| `seed` | 0-2147483647 | 0 | 0 derives a repeatable pattern from the clip |
+
+The damaged stream is not shipped as-is. Corrupt MPEG-4 plays differently in
+every decoder (some players freeze, skip or refuse it), so effex decodes it once
+with `-err_detect ignore_err` and bakes the result into clean h264 with the
+source audio: the output decodes without errors and looks the same everywhere.
+The intermediate encode uses four slice threads so the resync layout, and the
+damage for a given seed, is repeatable. bitrot runs its own pipeline, so it
+cannot be chained and has no preview.
+
 ## chains
 
 single-pass effects stack with `+`, and order matters: `stretch+deepfry` is not
@@ -961,7 +1000,7 @@ single-pass effects stack with `+`, and order matters: `stretch+deepfry` is not
 ./effex.py neon+archaeology+deepfry input/clip.mp4 --set archaeology.gap=12
 ```
 
-`datamosh`, `timescratch` and `blockswap` edit the codec stream, so they run
+`datamosh`, `timescratch`, `blockswap` and `bitrot` edit the codec stream, so they run
 their own multi-pass pipeline and cannot be chained. stateful processors
 (`sediment`, `collapse`, `inversion`, `archaeology`, `rasterslip`, `flowmosh`) can sit before or after
 ordinary filters, but several of them must stay adjacent. stateful previews are

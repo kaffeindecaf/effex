@@ -1937,6 +1937,134 @@ def run_datamosh(ctx: EffectContext, clip: Clip, tools: Tools, args,
             pass
 
 
+BITROT_PARAMS = (
+    Param("rate", "rot rate", "chance each targeted frame gets its bitstream damaged",
+          "percent", 15, minimum=0, maximum=100, step=5),
+    Param("hits", "hits", "corruptions written into each damaged frame",
+          "int", 2, minimum=1, maximum=16, step=1),
+    Param("mode", "rot mode", "what each corruption does to the coded bytes",
+          "choice", "mix", choices=(
+              ("mix", "mix", "a random flip, zero run or smear per hit"),
+              ("flip", "bit flips", "flip a few bits - small tears that drift"),
+              ("zero", "zero runs", "blank a run of bytes - blocks drop out"),
+              ("smear", "smear", "paste a byte run from elsewhere in the frame"),
+          )),
+    Param("target", "target", "which frames take the damage",
+          "choice", "p", choices=(
+              ("p", "motion frames", "P-VOPs - damage drifts until the next keyframe"),
+              ("i", "keyframes", "I-VOPs - bigger damage, carried by every frame after it"),
+              ("all", "all", "any frame"),
+          )),
+    Param("burst", "burst", "chance a hit keeps rotting the next 2-6 frames",
+          "percent", 30, minimum=0, maximum=100, step=5),
+    Param("hold", "hold", "frames between keyframes - how long damage persists",
+          "int", 48, minimum=2, maximum=600, step=2),
+    Param("grit", "grit", "how crunchy the intermediate mpeg4 encode is",
+          "int", 8, minimum=1, maximum=31, step=1),
+    Param("conceal", "concealment", "how the decoder covers what it cannot read",
+          "choice", "off", choices=(
+              ("off", "off", "raw garbage - stale and broken macroblocks show"),
+              ("guess", "guess", "guess motion and deblock - softer smears"),
+          )),
+    Param("seed", "random seed", "0 uses a repeatable seed derived from the input",
+          "int", 0, minimum=0, maximum=2147483647, step=1),
+)
+
+
+def build_bitrot(ctx: EffectContext) -> Plan:
+    opts = ctx.opts
+    width, height = _source_dims(ctx.clip, ctx.frame)
+    return Plan(
+        vf=(f"pass 1: mpeg4 keyint={opts.get('hold', 48)} q={opts.get('grit', 8)}, "
+            f"rot {opts.get('rate', 15)}% of {opts.get('target', 'p')} frames, "
+            "pass 2: decode with damage, bake to h264"),
+        out_suffix=ctx.suffix or "_BITROT",
+        width=width,
+        height=height,
+        notes=[
+            "real bitstream rot - coded macroblock bytes are corrupted; "
+            "start codes and frame headers stay intact",
+            f"{opts.get('mode', 'mix')} mode, {opts.get('hits', 2)} hits per frame, "
+            f"{opts.get('burst', 30)}% burst chance",
+            "damage drifts through motion frames until the next keyframe",
+            "the decoded damage is baked into clean h264, so every player "
+            "shows the same glitch",
+        ],
+    )
+
+
+def run_bitrot(ctx: EffectContext, clip: Clip, tools: Tools, args,
+               dst: Path, run_encode, on_progress, animate) -> tuple:
+    """encode mpeg4, rot the VOP payloads, decode the damage into h264."""
+    from bit_rot import rot_stream
+    opts = ctx.opts
+    hold = _clamp_int(opts.get("hold", 48), 48, 2, 600)
+    grit = _clamp_int(opts.get("grit", 8), 8, 1, 31)
+    chosen_seed = _clamp_int(opts.get("seed", 0), 0, 0, 2147483647)
+    seed = chosen_seed or (20260925 + (clip.size % 10000))
+    stem = Path(args.output_dir) / f".{clip.path.stem}_rot_{os.getpid()}"
+    raw, held = stem.with_suffix(".m4v"), stem.with_suffix(".mp4")
+    stderr_parts, elapsed = [], 0.0
+    try:
+        # fixed slice threads keep the resync layout (and the damage) repeatable
+        cmd1 = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
+                "-i", str(clip.path), "-an", "-threads", "4",
+                "-c:v", "mpeg4", "-q:v", str(grit), "-g", str(hold),
+                "-bf", "0", "-f", "m4v", "-progress", "pipe:1",
+                "-nostats", "-loglevel", "error", str(raw)]
+        rc, stderr, took = run_encode(cmd1, clip.duration, on_progress, animate)
+        elapsed += took
+        stderr_parts.append(stderr)
+        if rc != 0:
+            return False, "\n".join(stderr_parts), elapsed
+        if not raw.exists() or raw.stat().st_size == 0:
+            return False, "pass 1 produced no stream", elapsed
+        raw.write_bytes(rot_stream(
+            raw.read_bytes(), _clamp_int(opts.get("rate", 15), 15, 0, 100),
+            str(opts.get("mode", "mix")), str(opts.get("target", "p")),
+            _clamp_int(opts.get("burst", 30), 30, 0, 100),
+            _clamp_int(opts.get("hits", 2), 2, 1, 16), seed))
+        # a raw m4v carries no usable timestamps for a decode; a copy into
+        # mp4 recovers the VOP clock exactly like the datamosh remux
+        cmd2 = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
+                "-f", "m4v", "-i", str(raw), "-c:v", "copy",
+                "-loglevel", "error", str(held)]
+        rc, stderr, took = run_encode(cmd2, None, on_progress, animate)
+        elapsed += took
+        stderr_parts.append(stderr)
+        if rc != 0:
+            return False, "\n".join(stderr_parts), elapsed
+        cmd3 = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y",
+                "-err_detect", "ignore_err"]
+        if str(opts.get("conceal", "off")) == "off":
+            cmd3 += ["-ec", "0"]
+        cmd3 += ["-i", str(held), "-i", str(clip.path), "-map", "0:v:0"]
+        if clip.audio:
+            cmd3 += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+        else:
+            cmd3 += ["-an"]
+        cmd3 += ["-c:v", "libx264", "-crf", str(ctx.crf), "-preset", str(ctx.preset),
+                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                 "-progress", "pipe:1", "-nostats", "-loglevel", "error", str(dst)]
+        rc, stderr, took = run_encode(cmd3, clip.duration, on_progress, animate)
+        elapsed += took
+        # the decoder reports every damaged macroblock; that is the effect
+        stderr_parts.append("\n".join(
+            line for line in (stderr or "").splitlines()
+            if not line.startswith("[mpeg4 @")
+            and not line.strip().startswith("Last message repeated")))
+        if rc != 0:
+            return False, "\n".join(stderr_parts), elapsed
+        return True, "\n".join(stderr_parts), elapsed
+    finally:
+        for path in (raw, held):
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+
+
 ZOOM_PARAMS = (
     Param("zoom", "max zoom", "how far in it creeps (percent of the frame)",
           "int", 135, minimum=110, maximum=300, step=10),
@@ -2987,6 +3115,20 @@ EFFECTS = [
            blurb="turn the bitrate and resolution down",
            tag="scale, -b:v cap",
            build=build_crunch, params=CRUNCH_PARAMS),
+    Effect(key="bitrot", name="bitrot",
+           blurb="corrupt the codec bitstream - broken macroblocks drift",
+           tag="mpeg4 encode, VOP payload corruption, damaged decode baked to h264",
+           build=build_bitrot, params=BITROT_PARAMS,
+           run=run_bitrot,
+           stages=(
+               "pass 1: ffmpeg -i <clip> -an -threads 4 -c:v mpeg4 -q:v <grit> "
+               "-g <hold> -bf 0 -f m4v <clip>_rot.m4v",
+               "rot: rot_stream() flips, zeroes or smears bytes inside VOP "
+               "payloads - start codes, VOL and VOP headers stay intact",
+               "remux: ffmpeg -f m4v -i <clip>_rot.m4v -c:v copy <clip>_rot.mp4",
+               "pass 2: ffmpeg -err_detect ignore_err [-ec 0] -i <clip>_rot.mp4 "
+               "-i <clip> -c:v libx264 -c:a aac <output>.mp4",
+           )),
     Effect(key="timescratch", name="timescratch",
            blurb="drag the timeline cursor - forward, backward, slow, fast",
            tag="cut into segments, reverse+retime, concat",
@@ -3061,7 +3203,7 @@ EFFECT_GROUPS = (
         "trails", "timescratch", "sediment", "dropout", "inversion", "archaeology", "rasterslip",
     )),
     ("CODEC & BLOCKS", (
-        "datamosh", "blockswap", "flowmosh", "crunch",
+        "datamosh", "blockswap", "flowmosh", "crunch", "bitrot",
     )),
 )
 _grouped_effect_keys = tuple(key for _title, keys in EFFECT_GROUPS

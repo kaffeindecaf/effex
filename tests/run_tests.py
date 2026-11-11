@@ -21,6 +21,7 @@ HERE = Path(__file__).resolve().parent
 SUITES = {
     "cli": HERE / "cli_regression.py",
     "datamosh": HERE / "datamosh_features.py",
+    "bitrot": HERE / "bitrot_regression.py",
     "mosh-stream": HERE / "datamosh_stream.py",
     "self-mosh": HERE / "self_mosh.py",
     "pulse-mosh": HERE / "pulse_mosh.py",
