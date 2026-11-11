@@ -9,12 +9,25 @@ from fractions import Fraction
 from frame_pipeline import FramePacket
 
 
+class _PipeReader:
+    """Read-only view of a pipe with no seek: PyAV then streams it.
+
+    Seeking a pipe raises EINVAL on Windows, which PyAV does not swallow.
+    """
+
+    def __init__(self, pipe):
+        self.pipe = pipe
+
+    def read(self, size=-1):
+        return self.pipe.read(size)
+
+
 def read_packets(pipe, context, stop_event):
     import av
 
     pending = None
     previous_gap = Fraction(0)
-    with av.open(pipe, "r", format="nut") as source:
+    with av.open(_PipeReader(pipe), "r", format="nut") as source:
         for index, frame in enumerate(source.decode(video=0)):
             if stop_event.is_set():
                 return
